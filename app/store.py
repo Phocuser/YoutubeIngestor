@@ -22,7 +22,8 @@ class CaptionsStore:
                     published_at TEXT NOT NULL,
                     processed_at TEXT NOT NULL,
                     has_transcript BOOLEAN NOT NULL,
-                    pending_article_json TEXT DEFAULT NULL
+                    pending_article_json TEXT DEFAULT NULL,
+                    indexed_at TEXT DEFAULT NULL
                 )
                 """
             )
@@ -41,6 +42,10 @@ class CaptionsStore:
                 self.connection.execute(
                     "ALTER TABLE processed_videos ADD COLUMN pending_article_json TEXT DEFAULT NULL"
                 )
+            if "indexed_at" not in cols:
+                self.connection.execute(
+                    "ALTER TABLE processed_videos ADD COLUMN indexed_at TEXT DEFAULT NULL"
+                )
 
     def is_processed(self, video_id: str) -> bool:
         cursor = self.connection.execute(
@@ -57,6 +62,7 @@ class CaptionsStore:
         published_at: str,
         has_transcript: bool,
         pending_article_json: Optional[str] = None,
+        indexed_at: Optional[str] = None,
     ) -> bool:
         if self.is_processed(video_id):
             return False
@@ -65,8 +71,8 @@ class CaptionsStore:
             self.connection.execute(
                 """
                 INSERT INTO processed_videos (
-                    video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     video_id,
@@ -76,14 +82,42 @@ class CaptionsStore:
                     now,
                     1 if has_transcript else 0,
                     pending_article_json,
+                    indexed_at,
                 ),
             )
         return True
 
+    def mark_indexed(self, video_id: str, indexed_at: Optional[str] = None) -> None:
+        now = indexed_at or datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            self.connection.execute(
+                "UPDATE processed_videos SET indexed_at = ? WHERE video_id = ?",
+                (now, video_id),
+            )
+
+    def undelivered_with_transcript(self, limit: int = 25) -> List[Dict[str, Any]]:
+        cursor = self.connection.execute(
+            """
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, indexed_at
+            FROM processed_videos
+            WHERE has_transcript = 1
+              AND indexed_at IS NULL
+            ORDER BY processed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            d["has_transcript"] = bool(d["has_transcript"])
+            rows.append(d)
+        return rows
+
     def get_video(self, video_id: str) -> Optional[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, indexed_at
             FROM processed_videos
             WHERE video_id = ?
             """,
@@ -99,7 +133,7 @@ class CaptionsStore:
     def get_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, indexed_at
             FROM processed_videos
             ORDER BY processed_at DESC
             LIMIT ?

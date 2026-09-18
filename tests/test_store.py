@@ -91,3 +91,65 @@ def test_state_operations(temp_db):
 
     store.set_state("last_poll_status", "error: something broke")
     assert store.get_state("last_poll_status") == "error: something broke"
+
+
+def test_mark_indexed(temp_db):
+    store = CaptionsStore(temp_db)
+    store.record_video(
+        video_id="vid-1",
+        channel_id="chan-1",
+        title="Sample Video",
+        published_at="2026-09-18T10:00:00Z",
+        has_transcript=True,
+        pending_article_json='{"id": "vid-1"}',
+    )
+    rec = store.get_video("vid-1")
+    assert rec["indexed_at"] is None
+
+    store.mark_indexed("vid-1", indexed_at="2026-09-18T10:05:00Z")
+    rec_after = store.get_video("vid-1")
+    assert rec_after["indexed_at"] == "2026-09-18T10:05:00Z"
+
+
+def test_undelivered_with_transcript(temp_db):
+    store = CaptionsStore(temp_db)
+
+    # 1. Video with transcript, not indexed
+    store.record_video(
+        video_id="vid-1",
+        channel_id="chan-1",
+        title="Video 1",
+        published_at="2026-09-18T10:00:00Z",
+        has_transcript=True,
+        pending_article_json='{"id": "vid-1"}',
+    )
+    # 2. Video without transcript
+    store.record_video(
+        video_id="vid-2",
+        channel_id="chan-1",
+        title="Video 2 (no transcript)",
+        published_at="2026-09-18T10:01:00Z",
+        has_transcript=False,
+        pending_article_json=None,
+    )
+    # 3. Video with transcript, already indexed
+    store.record_video(
+        video_id="vid-3",
+        channel_id="chan-1",
+        title="Video 3",
+        published_at="2026-09-18T10:02:00Z",
+        has_transcript=True,
+        pending_article_json='{"id": "vid-3"}',
+        indexed_at="2026-09-18T10:05:00Z",
+    )
+
+    undelivered = store.undelivered_with_transcript(limit=25)
+    assert len(undelivered) == 1
+    assert undelivered[0]["video_id"] == "vid-1"
+    assert undelivered[0]["has_transcript"] is True
+    assert undelivered[0]["pending_article_json"] == '{"id": "vid-1"}'
+    assert undelivered[0]["indexed_at"] is None
+
+    # Mark vid-1 as indexed
+    store.mark_indexed("vid-1")
+    assert len(store.undelivered_with_transcript()) == 0
