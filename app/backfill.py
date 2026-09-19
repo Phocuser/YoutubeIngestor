@@ -233,6 +233,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--channels", default="", help="comma-separated @handles/UC ids (default: BACKFILL_CHANNELS)")
     parser.add_argument("--no-discover", action="store_true", help="skip re-listing the channel(s)")
     parser.add_argument("--no-postgres", action="store_true", help="skip the Postgres write (indexer only)")
+    parser.add_argument("--delay-min", type=float, default=12.0, help="min seconds between videos")
+    parser.add_argument("--delay-max", type=float, default=20.0, help="max seconds between videos")
     parser.add_argument("--stats", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -244,7 +246,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     pg = None if args.no_postgres else MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
     channels = [c.strip() for c in args.channels.split(",") if c.strip()] or settings.backfill_channels
-    summary = Backfill(settings, store, pg).run(
+    summary = Backfill(settings, store, pg, delay=(args.delay_min, args.delay_max)).run(
         channels, limit=args.limit, max_hours=args.max_hours, discover=not args.no_discover
     )
     print(json.dumps(asdict(summary), indent=2))
