@@ -12,6 +12,7 @@ def test_settings_defaults():
         assert settings.mycelium_redis_addr == "127.0.0.1:6381"
         assert settings.poll_interval_seconds == 900
         assert settings.database_path == "data/youtube_captions.sqlite3"
+        assert settings.backfill_channels == ["@warographics643", "@HomeFronts"]
 
 
 def test_settings_custom_env():

@@ -6,11 +6,16 @@ ad reads, and deliver the spoken text to Mycelium (Postgres + indexer).
 State lives in SQLite, so an interrupted or throttled run simply resumes next time.
 """
 import argparse
+import errno
+import fcntl
 import json
 import logging
 import random
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import channel_videos, sponsor
@@ -24,6 +29,27 @@ LOGGER = logging.getLogger(__name__)
 
 MIN_WORDS = 60
 BLOCK_BACKOFF_SECONDS = (300, 900, 1800, 1800, 3600)
+
+
+class AlreadyRunning(RuntimeError):
+    """Raised when another backfill process owns the single-instance lock."""
+
+
+@contextmanager
+def single_instance(path: str):
+    lock_path = Path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise AlreadyRunning(f"backfill lock is held: {path}") from exc
+            raise
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass
@@ -56,6 +82,7 @@ class Backfill:
         index: Callable = run_indexer,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
         delay: tuple = (3.0, 6.0),
     ) -> None:
         self.settings = settings
@@ -68,6 +95,7 @@ class Backfill:
         self._index = index
         self._sleep = sleep
         self._clock = clock
+        self._wall = wall
         self._delay = delay
 
     # -- discovery ----------------------------------------------------------
@@ -129,14 +157,34 @@ class Backfill:
 
     # -- one video ----------------------------------------------------------
 
+    def _wait_out_cooldown(self) -> None:
+        """Sleep through a persisted YouTube cooldown (survives restarts) so no
+        request of any kind is sent while we know we are being throttled."""
+        blocked_until = float(self.store.get_state("blocked_until", "0") or 0)
+        remaining = blocked_until - self._wall()
+        if remaining > 0:
+            LOGGER.warning("YouTube cooldown active; sleeping %.1fs", remaining)
+            self._sleep(remaining)
+            self.store.set_state("blocked_until", "0")
+
     def _transcript_with_backoff(self, video_id: str, summary: Summary):
         """Fetch a transcript, sleeping through YouTube throttling. Returns
         ``(snippets_or_None, ok)``; ok=False means we gave up (still blocked)."""
-        for attempt, wait in enumerate(BLOCK_BACKOFF_SECONDS + (None,)):
+        self._wait_out_cooldown()
+
+        for attempt in range(len(BLOCK_BACKOFF_SECONDS) + 1):
             try:
-                return self._fetch_transcript(video_id), True
+                transcript = self._fetch_transcript(video_id)
+                self.store.set_state("block_count", "0")
+                return transcript, True
             except TranscriptBlocked:
-                if wait is None:
+                block_count = int(self.store.get_state("block_count", "0") or 0) + 1
+                wait = BLOCK_BACKOFF_SECONDS[
+                    min(block_count - 1, len(BLOCK_BACKOFF_SECONDS) - 1)
+                ]
+                self.store.set_state("block_count", str(block_count))
+                self.store.set_state("blocked_until", str(self._wall() + wait))
+                if attempt == len(BLOCK_BACKOFF_SECONDS):
                     return None, False
                 LOGGER.warning("YouTube throttling us (attempt %d); sleeping %ds", attempt + 1, wait)
                 self._sleep(wait)
@@ -146,6 +194,7 @@ class Backfill:
         """Returns False when the run should stop (persistent throttling)."""
         video_id = row["video_id"]
         try:
+            self._wait_out_cooldown()
             meta = self._fetch_meta(video_id)
             if channel_videos.is_upcoming_or_live(meta):
                 summary.skipped_live += 1
@@ -209,6 +258,7 @@ class Backfill:
     ) -> Summary:
         summary = Summary()
         started = self._clock()
+        self._wait_out_cooldown()
         if discover:
             self.discover(channels, summary)
         self.retry_sweep(summary)
@@ -244,11 +294,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.stats:
         print(json.dumps(store.stats(), indent=2))
         return 0
-    pg = None if args.no_postgres else MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
-    channels = [c.strip() for c in args.channels.split(",") if c.strip()] or settings.backfill_channels
-    summary = Backfill(settings, store, pg, delay=(args.delay_min, args.delay_max)).run(
-        channels, limit=args.limit, max_hours=args.max_hours, discover=not args.no_discover
-    )
+    try:
+        with single_instance(settings.backfill_database_path + ".lock"):
+            pg = None if args.no_postgres else MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
+            channels = [c.strip() for c in args.channels.split(",") if c.strip()] or settings.backfill_channels
+            summary = Backfill(settings, store, pg, delay=(args.delay_min, args.delay_max)).run(
+                channels, limit=args.limit, max_hours=args.max_hours, discover=not args.no_discover
+            )
+    except AlreadyRunning:
+        print("backfill already running; exiting", file=sys.stderr)
+        return 3
     print(json.dumps(asdict(summary), indent=2))
     return 1 if summary.aborted else 0
 

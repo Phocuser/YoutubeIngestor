@@ -274,3 +274,29 @@ def test_memory_database() -> None:
     assert store.register("vid-mem", "chan-1", "Memory Video") is True
     assert store.get("vid-mem") is not None
     store.close()
+
+
+def test_done_with_envelope(tmp_path: Path) -> None:
+    db_file = str(tmp_path / "backfill.db")
+    store = BackfillStore(db_file)
+
+    store.register("vid-1", "chan-1", "Video 1")
+    store.register("vid-2", "chan-1", "Video 2")
+    store.register("vid-3", "chan-1", "Video 3")
+    store.register("vid-4", "chan-1", "Video 4")
+    store.register("vid-5", "chan-1", "Video 5")
+
+    store.mark_done("vid-1", "2026-09-18T10:00:00Z", "uuid-1", '{"text": "1"}', "{}")
+    store.mark_done("vid-2", "2026-09-18T10:01:00Z", "uuid-2", '{"text": "2"}', "{}")
+    store.mark_indexed("vid-2")
+    store.mark_done("vid-4", "2026-09-18T10:02:00Z", "uuid-4", "", "{}")
+    store.mark_no_transcript("vid-5")
+
+    all_done = store.done_with_envelope(limit=0)
+    assert [r["video_id"] for r in all_done] == ["vid-1", "vid-2"]
+
+    limited = store.done_with_envelope(limit=1)
+    assert [r["video_id"] for r in limited] == ["vid-1"]
+
+    store.close()
+

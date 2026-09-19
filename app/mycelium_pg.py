@@ -25,14 +25,34 @@ def watch_url(video_id: str) -> str:
 
 
 class MyceliumPg:
-    def __init__(self, pg_url: str, mycelium_dir: str):
+    def __init__(self, pg_url: str, mycelium_dir: str, redis_addr: str = "127.0.0.1:6381"):
         root = str(Path(mycelium_dir).resolve())
         if root not in sys.path:
             sys.path.insert(0, root)
         from persistence import Article, ArticleStore, Database  # noqa: PLC0415
 
         self._Article = Article
-        self._store = ArticleStore(Database(pg_url))
+        self._db = Database(pg_url)
+        self._store = ArticleStore(self._db)
+        host, _, port = redis_addr.partition(":")
+        self._redis = (host, int(port or 6379))
+
+    def drain_worker(self, max_idle_batches: int = 1, max_batches: int = 500) -> int:
+        """Run Mycelium's consumer-group worker until the candidate stream is idle;
+        returns the number of candidates handled."""
+        import redis  # noqa: PLC0415
+        from worker.consumer import RedisConsumer  # noqa: PLC0415
+
+        client = redis.Redis(host=self._redis[0], port=self._redis[1], decode_responses=True)
+        consumer = RedisConsumer(client, self._db, consumer_name="youtube-captions")
+        handled = idle = 0
+        for _ in range(max_batches):
+            n = consumer.run_once(count=10, block_ms=1000)
+            handled += n
+            idle = 0 if n else idle + 1
+            if idle >= max_idle_batches:
+                break
+        return handled
 
     def insert(self, envelope: Dict[str, Any], metadata: Dict[str, Any]) -> str:
         """Store one transcript article; returns STORED or ALREADY_PRESENT."""

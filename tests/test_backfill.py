@@ -1,8 +1,12 @@
 """Tests for the channel backfill orchestrator."""
 import functools
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.backfill import Backfill
+import pytest
+
+from app.backfill import AlreadyRunning, Backfill, main, single_instance
 from app.backfill_store import BackfillStore
 from app.channel_videos import VideoMeta, VideoRef
 from app.config import Settings
@@ -226,3 +230,96 @@ def test_already_present_pg(tmp_path):
     summary = b.run(["@x"])
     assert summary.already_present == 1 and summary.stored == 0
     assert store.get("vid00000001")["persisted_at"] is not None
+
+
+def test_persisted_cooldown_sleeps_before_fetch(tmp_path):
+    events, now = [], [1000.0]
+    b, store, _, _ = make_backfill(
+        tmp_path,
+        fetch_transcript=lambda v: events.append("fetch") or list(LONG_TRANSCRIPT),
+        sleep=lambda seconds: events.append(("sleep", seconds)),
+    )
+    b._wall = lambda: now[0]
+    store.set_state("blocked_until", "1100")
+    b._transcript_with_backoff("vid00000001", b.run([]))
+    assert events[0] == ("sleep", 100.0) and events[1] == "fetch"
+
+
+def test_persisted_block_count_escalates_and_success_resets(tmp_path):
+    store = BackfillStore(str(tmp_path / "b.sqlite3"))
+    waits, now = [], [1000.0]
+    first = iter([TranscriptBlocked("blocked"), RuntimeError("stop")])
+
+    def first_fetch(video_id):
+        result = next(first)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    b1, _, _, _ = make_backfill(tmp_path, fetch_transcript=first_fetch, sleep=waits.append)
+    b1._wall = lambda: now[0]
+    with pytest.raises(RuntimeError):
+        b1._transcript_with_backoff("v1", b1.run([]))
+    now[0] = 1300.0
+    calls = iter([TranscriptBlocked("blocked"), list(LONG_TRANSCRIPT)])
+
+    def second_fetch(video_id):
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    b2 = Backfill(
+        Settings(), store, FakePg(), fetch_transcript=second_fetch,
+        clean=fake_clean, sleep=waits.append, wall=lambda: now[0], index=FakeIndexer(),
+    )
+    b2._transcript_with_backoff("v1", b2.run([]))
+    assert waits[-1] == 900 and store.get_state("block_count") == "0"
+
+
+def test_cooldown_in_past_does_not_sleep(tmp_path):
+    calls = []
+    b, store, _, _ = make_backfill(
+        tmp_path, fetch_transcript=lambda v: calls.append(v) or list(LONG_TRANSCRIPT),
+        sleep=lambda seconds: calls.append(seconds),
+    )
+    b._wall = lambda: 1000.0
+    store.set_state("blocked_until", "999")
+    b._transcript_with_backoff("vid00000001", b.run([]))
+    assert calls == ["vid00000001"]
+
+
+def test_single_instance_releases_and_main_reports_running(tmp_path, capsys):
+    lock = str(tmp_path / "nested" / "backfill.lock")
+    with single_instance(lock):
+        with pytest.raises(AlreadyRunning):
+            with single_instance(lock):
+                pass
+    with single_instance(lock):
+        pass
+
+    database = str(tmp_path / "backfill.sqlite3")
+    settings_factory = lambda: Settings(backfill_database_path=os.environ["BACKFILL_DATABASE_PATH"])
+    with patch.dict(os.environ, {"BACKFILL_DATABASE_PATH": database}), patch(
+        "app.backfill.Settings", side_effect=settings_factory
+    ), patch("app.backfill.MyceliumPg"):
+        with single_instance(database + ".lock"):
+            assert main(["--no-postgres"]) == 3
+    assert "already running" in capsys.readouterr().err
+
+
+def test_cooldown_is_honored_before_the_metadata_request_too(tmp_path):
+    """No YouTube request of any kind (yt-dlp metadata included) during a cooldown."""
+    order = []
+    now = 1_000.0
+    b, store, _, _ = make_backfill(
+        tmp_path,
+        fetch_meta=lambda v: (order.append("meta"), VideoMeta(v, "T", "2026-09-15T00:00:00Z", 900, "UC", "WarFronts", "", ""))[1],
+        fetch_transcript=lambda v: (order.append("transcript"), list(LONG_TRANSCRIPT))[1],
+        sleep=lambda s: order.append(("sleep", round(s))),
+    )
+    b._wall = lambda: now
+    store.set_state("blocked_until", str(now + 120))
+    b.run(["@x"], discover=True)
+    assert order[0] == ("sleep", 120)
+    assert order.index("meta") > 0 and order.count(("sleep", 120)) == 1

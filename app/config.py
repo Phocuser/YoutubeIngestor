@@ -34,7 +34,7 @@ class Settings:
     mycelium_dir: str = os.getenv("MYCELIUM_DIR", "../mycelium")
     backfill_channels: list[str] = field(
         default_factory=lambda: _parse_channel_ids(
-            os.getenv("BACKFILL_CHANNELS", "@warographics643")
+            os.getenv("BACKFILL_CHANNELS", "@warographics643,@HomeFronts")
         )
     )
     backfill_database_path: str = os.getenv(

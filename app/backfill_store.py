@@ -271,6 +271,32 @@ class BackfillStore:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
+    def done_with_envelope(self, limit: int = 0) -> List[Dict[str, Any]]:
+        with self._lock:
+            if limit > 0:
+                cursor = self.connection.execute(
+                    """
+                    SELECT * FROM backfill_videos
+                    WHERE status = 'done'
+                      AND pending_article_json IS NOT NULL
+                      AND pending_article_json != ''
+                    ORDER BY created_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            else:
+                cursor = self.connection.execute(
+                    """
+                    SELECT * FROM backfill_videos
+                    WHERE status = 'done'
+                      AND pending_article_json IS NOT NULL
+                      AND pending_article_json != ''
+                    ORDER BY created_at ASC, rowid ASC
+                    """
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
         with self._lock:
             cursor = self.connection.execute(
