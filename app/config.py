@@ -27,3 +27,16 @@ class Settings:
         "INDEXER_MARKERS_PATH", "../mycelium/seeds/incident_markers.json"
     )
     mycelium_redis_addr: str = os.getenv("MYCELIUM_REDIS_ADDR", "127.0.0.1:6381")
+    mycelium_pg_url: str = os.getenv(
+        "MYCELIUM_PG_URL",
+        "postgres://intel_admin:mycelium_local_dev_password@127.0.0.1:5434/intel_graph",
+    )
+    mycelium_dir: str = os.getenv("MYCELIUM_DIR", "../mycelium")
+    backfill_channels: list[str] = field(
+        default_factory=lambda: _parse_channel_ids(
+            os.getenv("BACKFILL_CHANNELS", "@warographics643")
+        )
+    )
+    backfill_database_path: str = os.getenv(
+        "BACKFILL_DATABASE_PATH", "data/backfill.sqlite3"
+    )

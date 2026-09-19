@@ -146,6 +146,36 @@ def fetch_transcript(video_id: str) -> Optional[str]:
     return joined if joined else None
 
 
+BLOCK_EXCEPTION_NAMES = ("RequestBlocked", "IpBlocked", "TooManyRequests")
+
+
+class TranscriptBlocked(Exception):
+    """YouTube is rate-limiting/blocking transcript requests from this IP."""
+
+
+def fetch_timed_transcript(
+    video_id: str, languages: tuple = ("en", "en-US", "en-GB")
+) -> Optional[List[tuple]]:
+    """Return ``[(text, start, duration), ...]`` or None when no captions exist.
+
+    Raises :class:`TranscriptBlocked` when YouTube throttles this IP, so callers can
+    back off; other genuine errors propagate.
+    """
+    try:
+        data = YouTubeTranscriptApi().fetch(video_id, languages=list(languages))
+    except NO_TRANSCRIPT_EXCEPTIONS:
+        return None
+    except Exception as exc:
+        name = exc.__class__.__name__
+        if name in BLOCK_EXCEPTION_NAMES:
+            raise TranscriptBlocked(name) from exc
+        if name in ("VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId"):
+            return None
+        raise
+    out = [(item.text, float(item.start), float(item.duration)) for item in data if item.text]
+    return out or None
+
+
 class YouTubeClient:
     """Client for YouTube RSS feed and transcript fetching."""
 

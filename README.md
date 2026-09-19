@@ -110,3 +110,22 @@ Run test suite with pytest:
 ```bash
 PYTHONPATH=. pytest tests -v
 ```
+
+
+---
+
+## Channel backfill (transcripts without the ad reads)
+
+`app/backfill.py` ingests a whole channel's spoken content, resumable and unattended:
+
+```bash
+.venv/bin/python -m app.backfill --limit 5          # try a few
+scripts/overnight.sh                                # everything, re-running through throttling
+.venv/bin/python -m app.backfill --stats            # progress
+```
+
+Flow: `yt-dlp` lists the channel (`BACKFILL_CHANNELS`, default `@warographics643` = WarFronts; the channel's Atom feed 404s) -> per video, timed captions via `youtube-transcript-api` -> **ad reads / self-promo cut** (`app/sponsor.py`) -> Mycelium Postgres `articles` (`source_id = yt:<video_id>`, `source_agency` = channel name, via Mycelium's `ArticleStore`) and `cmd/indexer` -> Redis. Postgres `id` and the indexer `id` are the same UUIDv5 so `event_nodes.article_id` resolves.
+
+Ad removal: SponsorBlock's community segments (`sponsor`, `selfpromo`, `interaction`) are used when they exist; otherwise a conservative keyword heuristic anchored on the spoken transitions ("before we go any further" ... "let's get back to"). What was removed is recorded per article in `metadata` (`ads_removed_seconds`, `ad_removal_sources`).
+
+State is in `data/backfill.sqlite3`; YouTube throttling triggers long backoffs and a resumed round, never lost work. Videos with no captions are recorded as `no_transcript`.
