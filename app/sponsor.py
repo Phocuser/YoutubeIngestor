@@ -33,6 +33,8 @@ class CleanResult:
     total_snippets: int
     sources: List[str]
     ranges: List[Tuple[float, float]]
+    decisions: List[dict] = None
+    policy_version: str = "ads-v1"
 
 
 class SponsorBlockUnavailable(Exception):
@@ -414,4 +416,8 @@ def clean_transcript(
         total_snippets=len(norm),
         sources=sources,
         ranges=applied_ranges,
+        decisions=[
+            {"segment_index": i, "decision": "excluded" if any(start <= item.start <= end for start, end in applied_ranges) else "included", "reason": "mapped_ad_range" if applied_ranges else "no_ad_range", "source": ",".join(sources) or "none", "start": item.start, "end": effective_end(item, norm[i + 1] if i + 1 < len(norm) else None)}
+            for i, item in enumerate(norm)
+        ],
     )

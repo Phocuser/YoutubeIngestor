@@ -1,4 +1,5 @@
 import logging
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -50,6 +51,14 @@ class BackfillStore:
                     )
                     """
                 )
+                for column, definition in (
+                    ("review_state", "TEXT NOT NULL DEFAULT 'ready'"),
+                    ("review_reason", "TEXT"),
+                ):
+                    try:
+                        self.connection.execute(f"ALTER TABLE backfill_videos ADD COLUMN {column} {definition}")
+                    except sqlite3.OperationalError:
+                        pass
                 self.connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS backfill_state (
@@ -101,7 +110,8 @@ class BackfillStore:
                 cursor = self.connection.execute(
                     """
                     SELECT * FROM backfill_videos
-                    WHERE status = 'pending' OR (status = 'error' AND attempts < ?)
+                    WHERE review_state = 'ready'
+                      AND (status = 'pending' OR (status = 'error' AND attempts < ?))
                     ORDER BY created_at ASC, rowid ASC
                     LIMIT ?
                     """,
@@ -111,7 +121,8 @@ class BackfillStore:
                 cursor = self.connection.execute(
                     """
                     SELECT * FROM backfill_videos
-                    WHERE status = 'pending' OR (status = 'error' AND attempts < ?)
+                    WHERE review_state = 'ready'
+                      AND (status = 'pending' OR (status = 'error' AND attempts < ?))
                     ORDER BY created_at ASC, rowid ASC
                     """,
                     (max_attempts,),
@@ -187,6 +198,25 @@ class BackfillStore:
                     (err_msg, now, video_id),
                 )
 
+    def quarantine(self, video_id: str, reason: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            with self.connection:
+                self.connection.execute(
+                    """UPDATE backfill_videos
+                       SET review_state = 'revision_needed', review_reason = ?,
+                           status = 'quarantined', last_error = ?, updated_at = ?
+                       WHERE video_id = ?""",
+                    (reason, reason, now, video_id),
+                )
+
+    def replace_pending(self, video_id: str, envelope: Dict[str, Any]) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "UPDATE backfill_videos SET pending_article_json = ?, updated_at = ? WHERE video_id = ? AND review_state = 'ready'",
+                (json.dumps(envelope), _now_iso(), video_id),
+            )
+
     def mark_persisted(
         self, video_id: str, persisted_at: Optional[str] = None
     ) -> None:
@@ -227,7 +257,7 @@ class BackfillStore:
                 cursor = self.connection.execute(
                     """
                     SELECT * FROM backfill_videos
-                    WHERE status = 'done' AND persisted_at IS NULL
+                    WHERE status = 'done' AND persisted_at IS NULL AND review_state = 'ready'
                     ORDER BY created_at ASC, rowid ASC
                     LIMIT ?
                     """,
@@ -237,7 +267,7 @@ class BackfillStore:
                 cursor = self.connection.execute(
                     """
                     SELECT * FROM backfill_videos
-                    WHERE status = 'done' AND persisted_at IS NULL
+                    WHERE status = 'done' AND persisted_at IS NULL AND review_state = 'ready'
                     ORDER BY created_at ASC, rowid ASC
                     """
                 )
@@ -251,6 +281,8 @@ class BackfillStore:
                     SELECT * FROM backfill_videos
                     WHERE status = 'done'
                       AND indexed_at IS NULL
+                      AND persisted_at IS NOT NULL
+                      AND review_state = 'ready'
                       AND pending_article_json IS NOT NULL
                       AND pending_article_json != ''
                     ORDER BY created_at ASC, rowid ASC
@@ -264,6 +296,8 @@ class BackfillStore:
                     SELECT * FROM backfill_videos
                     WHERE status = 'done'
                       AND indexed_at IS NULL
+                      AND persisted_at IS NOT NULL
+                      AND review_state = 'ready'
                       AND pending_article_json IS NOT NULL
                       AND pending_article_json != ''
                     ORDER BY created_at ASC, rowid ASC
@@ -278,6 +312,8 @@ class BackfillStore:
                     """
                     SELECT * FROM backfill_videos
                     WHERE status = 'done'
+                      AND persisted_at IS NOT NULL
+                      AND review_state = 'ready'
                       AND pending_article_json IS NOT NULL
                       AND pending_article_json != ''
                     ORDER BY created_at ASC, rowid ASC
@@ -290,6 +326,8 @@ class BackfillStore:
                     """
                     SELECT * FROM backfill_videos
                     WHERE status = 'done'
+                      AND persisted_at IS NOT NULL
+                      AND review_state = 'ready'
                       AND pending_article_json IS NOT NULL
                       AND pending_article_json != ''
                     ORDER BY created_at ASC, rowid ASC

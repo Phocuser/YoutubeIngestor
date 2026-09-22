@@ -9,6 +9,7 @@ from .config import Settings
 from .service import CaptionsService
 from .store import CaptionsStore
 from .youtube_client import YouTubeClient
+from .mycelium_pg import MyceliumPg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,7 +20,8 @@ LOGGER = logging.getLogger("mycelium-youtube-captions")
 settings = Settings()
 store = CaptionsStore(settings.database_path)
 client = YouTubeClient()
-service = CaptionsService(settings, store, client)
+submitter = MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
+service = CaptionsService(settings, store, client, submitter)
 
 
 @asynccontextmanager

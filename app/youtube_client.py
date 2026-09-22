@@ -13,6 +13,17 @@ from youtube_transcript_api._errors import (
 
 LOGGER = logging.getLogger(__name__)
 
+
+class TimedTranscript(list):
+    """List-compatible captions plus provider track provenance."""
+
+    def __init__(self, rows, *, track_id="unknown", language="unknown", caption_kind="unknown", source_metadata=None):
+        super().__init__(rows)
+        self.track_id = track_id
+        self.language = language
+        self.caption_kind = caption_kind
+        self.source_metadata = source_metadata or {}
+
 ATOM_NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
     "yt": "http://www.youtube.com/xml/schemas/2015",
@@ -172,8 +183,12 @@ def fetch_timed_transcript(
         if name in ("VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId"):
             return None
         raise
-    out = [(item.text, float(item.start), float(item.duration)) for item in data if item.text]
-    return out or None
+    track = getattr(data, "snippets", data)
+    rows = [(item.text, float(item.start), float(item.duration)) for item in track if item.text]
+    return TimedTranscript(rows, track_id=str(getattr(data, "track_id", "unknown")),
+                           language=str(getattr(data, "language_code", "unknown")),
+                           caption_kind="asr" if bool(getattr(data, "is_generated", False)) else "manual",
+                           source_metadata={"provider": "youtube"}) or None
 
 
 class YouTubeClient:
@@ -187,3 +202,6 @@ class YouTubeClient:
 
     def fetch_transcript(self, video_id: str) -> Optional[str]:
         return fetch_transcript(video_id)
+
+    def fetch_timed_transcript(self, video_id: str) -> Optional[List[tuple]]:
+        return fetch_timed_transcript(video_id)

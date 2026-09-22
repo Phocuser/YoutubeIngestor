@@ -3,6 +3,8 @@ persistence layer (imported from the Mycelium checkout, so no SQL lives here).""
 import logging
 import sys
 import uuid
+import base64
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -12,6 +14,7 @@ LOGGER = logging.getLogger(__name__)
 UUID_PREFIX = "mycelium.youtube.v1/"
 STORED = "stored"
 ALREADY_PRESENT = "already_present"
+QUARANTINED = "revision_needed"
 
 
 def article_uuid(video_id: str) -> str:
@@ -29,50 +32,36 @@ class MyceliumPg:
         root = str(Path(mycelium_dir).resolve())
         if root not in sys.path:
             sys.path.insert(0, root)
-        from persistence import Article, ArticleStore, Database  # noqa: PLC0415
-
-        self._Article = Article
+        from persistence import Database  # noqa: PLC0415
         self._db = Database(pg_url)
-        self._store = ArticleStore(self._db)
         host, _, port = redis_addr.partition(":")
         self._redis = (host, int(port or 6379))
+        self.last_stored = None
+
+    def submit(self, envelope: Dict[str, Any], metadata: Dict[str, Any]):
+        """Submit poll and backfill output through the common receipt boundary."""
+        from contracts.capture import Submission  # noqa: PLC0415
+        from persistence.ingest import admit  # noqa: PLC0415
+        video_id = str(metadata["video_id"])
+        raw = str(envelope["raw_content"]).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        submission = Submission(
+            schema_version="capture.v1", submission_id=uuid.uuid4(), idempotency_key=f"youtube:{video_id}:{digest}",
+            adapter="youtube", adapter_version="capture-v1", submission_kind="capture", correlation_id=uuid.uuid4(),
+            source={"source_id": "youtube", "scope": f"video:{video_id}"}, requested_url=watch_url(video_id), canonical_url=watch_url(video_id), final_url=watch_url(video_id),
+            metadata={**metadata, "video_id": video_id, "source_alias": f"youtube:{video_id}",
+                      "content_scope": "full_text", "access_state": "allowed",
+                      "caption_track": envelope.get("caption_track"),
+                      "cleaning": envelope.get("cleaning", {})},
+            capture={"capture_type": "supplied_capture", "content_base64": base64.b64encode(raw).decode("ascii"), "byte_length": len(raw), "sha256": digest, "media_type": "text/plain", "retrieval_metadata": {"provider": "youtube", "video_id": video_id}},
+        )
+        return admit(self._db, submission, principal_id="youtube-adapter")
 
     def drain_worker(self, max_idle_batches: int = 1, max_batches: int = 500) -> int:
         """Run Mycelium's consumer-group worker until the candidate stream is idle;
         returns the number of candidates handled."""
-        import redis  # noqa: PLC0415
-        from worker.consumer import RedisConsumer  # noqa: PLC0415
-
-        client = redis.Redis(host=self._redis[0], port=self._redis[1], decode_responses=True)
-        consumer = RedisConsumer(client, self._db, consumer_name="youtube-captions")
-        handled = idle = 0
-        for _ in range(max_batches):
-            n = consumer.run_once(count=10, block_ms=1000)
-            handled += n
-            idle = 0 if n else idle + 1
-            if idle >= max_idle_batches:
-                break
-        return handled
+        LOGGER.warning("legacy importer worker drain disabled; use the central Mycelium worker")
+        return 0
 
     def insert(self, envelope: Dict[str, Any], metadata: Dict[str, Any]) -> str:
-        """Store one transcript article; returns STORED or ALREADY_PRESENT."""
-        from persistence import DuplicateArticleError  # noqa: PLC0415
-
-        video_id = metadata["video_id"]
-        article = self._Article(
-            id=envelope["id"],
-            raw_content=envelope["raw_content"],
-            source_url=watch_url(video_id),
-            canonical_url=watch_url(video_id),
-            source_id=f"yt:{video_id}",
-            published_at=envelope.get("published_at") or None,
-            source_agency=envelope["source_agency"],
-            extraction_version="youtube-backfill-v1",
-            metadata=metadata,
-        )
-        try:
-            stored = self._store.insert(article, retrieved_at=datetime.now(timezone.utc))
-        except DuplicateArticleError as exc:
-            LOGGER.info("already present with different content: %s", exc)
-            return ALREADY_PRESENT
-        return STORED if stored.id == envelope["id"] else ALREADY_PRESENT
+        raise RuntimeError("LEGACY_PATH_DISABLED: use submit()")

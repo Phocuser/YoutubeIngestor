@@ -21,8 +21,8 @@ from typing import Any, Callable, Dict, List, Optional
 from . import channel_videos, sponsor
 from .backfill_store import BackfillStore
 from .config import Settings
-from .indexer_client import run_indexer
-from .mycelium_pg import ALREADY_PRESENT, MyceliumPg, article_uuid
+from .models import timed_track
+from .mycelium_pg import ALREADY_PRESENT, QUARANTINED, MyceliumPg, article_uuid
 from .youtube_client import TranscriptBlocked, fetch_timed_transcript
 
 LOGGER = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ class Backfill:
         fetch_meta: Callable = channel_videos.fetch_video_meta,
         fetch_transcript: Callable = fetch_timed_transcript,
         clean: Callable = sponsor.clean_transcript,
-        index: Callable = run_indexer,
+        index: Callable | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
@@ -92,7 +92,9 @@ class Backfill:
         self._fetch_meta = fetch_meta
         self._fetch_transcript = fetch_transcript
         self._clean = clean
-        self._index = index
+        # Kept in the constructor for snapshot compatibility; adapter-owned
+        # indexing is intentionally not invoked.
+        self._index = None
         self._sleep = sleep
         self._clock = clock
         self._wall = wall
@@ -117,43 +119,31 @@ class Backfill:
 
     def _deliver_pg(self, row: Dict[str, Any], summary: Summary) -> None:
         if self.pg is None:
+            summary.delivery_failures += 1
+            LOGGER.warning("no explicit Mycelium capture boundary configured for %s", row["video_id"])
             return
         envelope = json.loads(row["pending_article_json"])
         metadata = json.loads(row["metadata_json"] or "{}")
         try:
-            outcome = self.pg.insert(envelope, metadata)
+            if hasattr(self.pg, "submit"):
+                receipt = self.pg.submit(envelope, metadata)
+                state = getattr(getattr(receipt, "state", None), "value", getattr(receipt, "state", None))
+                if state not in {"queued", "leased", "retry_wait", "succeeded"}:
+                    self.store.quarantine(row["video_id"], "central receipt requires review")
+                    summary.delivery_failures += 1
+                    return
+                self.store.mark_persisted(row["video_id"])
+                summary.stored += 1
+                return
+            raise RuntimeError("injected boundary must provide submit()")
         except Exception as exc:  # noqa: BLE001 - stays in the outbox for the next sweep
             LOGGER.warning("postgres insert failed for %s: %s", row["video_id"], exc)
             summary.delivery_failures += 1
             return
-        self.store.mark_persisted(row["video_id"])
-        if outcome == ALREADY_PRESENT:
-            summary.already_present += 1
-        else:
-            summary.stored += 1
-
-    def _deliver_indexer(self, row: Dict[str, Any], summary: Summary) -> None:
-        s = self.settings
-        ok, output = self._index(
-            json.loads(row["pending_article_json"]),
-            indexer_bin=s.indexer_bin,
-            dict_path=s.indexer_dict_path,
-            markers_path=s.indexer_markers_path,
-            redis_addr=s.mycelium_redis_addr,
-            timeout=120.0,
-        )
-        if ok:
-            self.store.mark_indexed(row["video_id"])
-            summary.indexed += 1
-        else:
-            LOGGER.warning("indexer failed for %s: %s", row["video_id"], output[:200])
-            summary.delivery_failures += 1
 
     def retry_sweep(self, summary: Summary) -> None:
         for row in self.store.undelivered_postgres():
             self._deliver_pg(row, summary)
-        for row in self.store.undelivered_indexer():
-            self._deliver_indexer(row, summary)
 
     # -- one video ----------------------------------------------------------
 
@@ -207,8 +197,28 @@ class Backfill:
                 self.store.mark_no_transcript(video_id, meta.published_at or None)
                 summary.no_transcript += 1
                 return True
-            snippets = [sponsor.Snippet(text=t, start=s, duration=d) for t, s, d in raw]
-            cleaned = self._clean(snippets, video_id)
+            if not isinstance(raw, (list, tuple)) or not raw:
+                self.store.mark_error(video_id, "malformed_or_empty_timed_captions")
+                summary.errors += 1
+                return True
+            track = timed_track(video_id, raw, track_id="backfill", language="unknown", caption_kind="unknown", source_metadata={"provider": "youtube"})
+            if any(s.start_ms is None or s.end_ms is None for s in track.segments):
+                # Unknown timing is evidence, not a zero timestamp.  Keep the
+                # source intact and expose the unresolved ad boundary for a
+                # later mapped review.
+                cleaned = sponsor.CleanResult(
+                    text=" ".join(s.text for s in track.segments), removed_seconds=0.0,
+                    removed_snippets=0, total_snippets=len(track.segments),
+                    sources=["timing_unknown"], ranges=[],
+                    decisions=[{"segment_index": i, "decision": "uncertain",
+                                "reason": "caption_timing_unknown", "source": "none"}
+                               for i, _ in enumerate(track.segments)],
+                )
+            else:
+                snippets = [sponsor.Snippet(text=s.text, start=s.start_ms / 1000.0,
+                                            duration=(s.end_ms - s.start_ms) / 1000.0)
+                            for s in track.segments]
+                cleaned = self._clean(snippets, video_id)
             if len(cleaned.text.split()) < MIN_WORDS:
                 self.store.mark_no_transcript(video_id, meta.published_at or None)
                 summary.no_transcript += 1
@@ -220,6 +230,9 @@ class Backfill:
                 "source_agency": meta.channel_name or "YouTube",
                 "published_at": meta.published_at,
                 "raw_content": cleaned.text,
+                "caption_track": track.to_dict(),
+                "cleaning": {"policy_version": cleaned.policy_version, "decisions": cleaned.decisions or [],
+                              "ranges": [list(r) for r in cleaned.ranges], "sources": list(cleaned.sources)},
             }
             metadata = {
                 "video_id": video_id,
@@ -231,6 +244,9 @@ class Backfill:
                 "ads_removed_seconds": round(cleaned.removed_seconds, 1),
                 "ads_removed_snippets": cleaned.removed_snippets,
                 "ad_removal_sources": cleaned.sources,
+                "ad_ranges": [list(r) for r in cleaned.ranges],
+                "ad_decisions": cleaned.decisions or [],
+                "ad_policy_version": cleaned.policy_version,
             }
             self.store.mark_done(
                 video_id, meta.published_at, envelope["id"], json.dumps(envelope), json.dumps(metadata)
@@ -239,7 +255,6 @@ class Backfill:
             summary.ads_removed_seconds += cleaned.removed_seconds
             fresh = self.store.get(video_id)
             self._deliver_pg(fresh, summary)
-            self._deliver_indexer(fresh, summary)
         except Exception as exc:  # noqa: BLE001 - one bad video must not stop the night
             LOGGER.warning("video %s failed: %s", video_id, exc)
             self.store.mark_error(video_id, f"{type(exc).__name__}: {exc}")
@@ -305,7 +320,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("backfill already running; exiting", file=sys.stderr)
         return 3
     print(json.dumps(asdict(summary), indent=2))
-    return 1 if summary.aborted else 0
+    return 1 if (summary.aborted or summary.delivery_failures or summary.errors) else 0
 
 
 if __name__ == "__main__":

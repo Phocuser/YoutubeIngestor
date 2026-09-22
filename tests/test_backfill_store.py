@@ -134,20 +134,21 @@ def test_undelivered_lists_and_shrink(tmp_path: Path) -> None:
     undelivered_pg = store.undelivered_postgres()
     undelivered_idx = store.undelivered_indexer()
     assert [r["video_id"] for r in undelivered_pg] == ["vid-1", "vid-2"]
-    assert [r["video_id"] for r in undelivered_idx] == ["vid-1", "vid-2"]
+    assert undelivered_idx == []
 
     # Persisting vid-1 shrinks Postgres list only
     store.mark_persisted("vid-1")
     assert [r["video_id"] for r in store.undelivered_postgres()] == ["vid-2"]
-    assert [r["video_id"] for r in store.undelivered_indexer()] == ["vid-1", "vid-2"]
+    assert [r["video_id"] for r in store.undelivered_indexer()] == ["vid-1"]
 
     # Indexing vid-1 shrinks Indexer list only
     store.mark_indexed("vid-1")
     assert [r["video_id"] for r in store.undelivered_postgres()] == ["vid-2"]
-    assert [r["video_id"] for r in store.undelivered_indexer()] == ["vid-2"]
+    assert store.undelivered_indexer() == []
 
     # Persist and index vid-2 leaves both lists empty
     store.mark_persisted("vid-2")
+    assert [r["video_id"] for r in store.undelivered_indexer()] == ["vid-2"]
     store.mark_indexed("vid-2")
     assert len(store.undelivered_postgres()) == 0
     assert len(store.undelivered_indexer()) == 0
@@ -291,6 +292,8 @@ def test_done_with_envelope(tmp_path: Path) -> None:
     store.mark_indexed("vid-2")
     store.mark_done("vid-4", "2026-09-18T10:02:00Z", "uuid-4", "", "{}")
     store.mark_no_transcript("vid-5")
+    store.mark_persisted("vid-1")
+    store.mark_persisted("vid-2")
 
     all_done = store.done_with_envelope(limit=0)
     assert [r["video_id"] for r in all_done] == ["vid-1", "vid-2"]
@@ -299,4 +302,3 @@ def test_done_with_envelope(tmp_path: Path) -> None:
     assert [r["video_id"] for r in limited] == ["vid-1"]
 
     store.close()
-

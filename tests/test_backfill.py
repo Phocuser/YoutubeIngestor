@@ -14,6 +14,7 @@ from app.mycelium_pg import ALREADY_PRESENT, STORED, article_uuid
 from app.sponsor import clean_transcript
 from app.youtube_client import TranscriptBlocked
 
+# Explicitly test-only timed-caption provider data; no live YouTube calls.
 LONG_TRANSCRIPT = [
     ("word alpha beta gamma delta epsilon zeta eta", float(i * 5), 5.0) for i in range(10)
 ]
@@ -23,11 +24,11 @@ class FakePg:
     def __init__(self, outcome=STORED, should_raise=False):
         self.outcome, self.should_raise, self.calls = outcome, should_raise, []
 
-    def insert(self, envelope, metadata):
+    def submit(self, envelope, metadata):
         if self.should_raise:
             raise RuntimeError("pg down")
         self.calls.append((envelope, metadata))
-        return self.outcome
+        return SimpleNamespace(state="queued" if self.outcome != ALREADY_PRESENT else "rejected")
 
 
 class FakeIndexer:
@@ -41,7 +42,8 @@ class FakeIndexer:
 
 def fake_clean(snips, vid):
     return SimpleNamespace(
-        text=" ".join(s.text for s in snips), removed_seconds=0.0, removed_snippets=0, sources=[]
+        text=" ".join(s.text for s in snips), removed_seconds=0.0, removed_snippets=0,
+        sources=[], ranges=[], decisions=[], policy_version="ads-v1"
     )
 
 
@@ -69,9 +71,9 @@ def test_happy_path(tmp_path):
     summary = b.run(["@x"])
     row = store.get("vid00000001")
     assert summary.done == 1 and row["status"] == "done"
-    assert row["persisted_at"] is not None and row["indexed_at"] is not None
+    assert row["persisted_at"] is not None
     expected_id = article_uuid("vid00000001")
-    assert pg.calls[0][0]["id"] == indexer.calls[0][0]["id"] == expected_id
+    assert pg.calls[0][0]["id"] == expected_id
     assert pg.calls[0][0]["source_agency"] == "WarFronts"
     assert pg.calls[0][0]["published_at"] == "2026-09-15T00:00:00Z"
     metadata = pg.calls[0][1]
@@ -169,14 +171,14 @@ def test_postgres_failure_and_retry(tmp_path):
 
 
 def test_indexer_failure_and_retry(tmp_path):
-    indexer = FakeIndexer(ok=False, output="boom")
-    b, store, _, _ = make_backfill(tmp_path, indexer=indexer)
+    pg = FakePg(should_raise=True)
+    b, store, _, _ = make_backfill(tmp_path, pg=pg)
     b.run(["@x"])
-    assert store.get("vid00000001")["indexed_at"] is None
+    assert store.get("vid00000001")["persisted_at"] is None
 
-    indexer.ok = True
+    pg.should_raise = False
     b.run(["@x"], discover=False)
-    assert store.get("vid00000001")["indexed_at"] is not None
+    assert store.get("vid00000001")["persisted_at"] is not None
 
 
 def test_live_video_skipped(tmp_path):
@@ -228,8 +230,8 @@ def test_already_present_pg(tmp_path):
     pg = FakePg(outcome=ALREADY_PRESENT)
     b, store, _, _ = make_backfill(tmp_path, pg=pg)
     summary = b.run(["@x"])
-    assert summary.already_present == 1 and summary.stored == 0
-    assert store.get("vid00000001")["persisted_at"] is not None
+    assert summary.delivery_failures == 1 and summary.stored == 0
+    assert store.get("vid00000001")["persisted_at"] is None
 
 
 def test_persisted_cooldown_sleeps_before_fetch(tmp_path):

@@ -144,12 +144,15 @@ def test_undelivered_with_transcript(temp_db):
     )
 
     undelivered = store.undelivered_with_transcript(limit=25)
-    assert len(undelivered) == 1
-    assert undelivered[0]["video_id"] == "vid-1"
+    assert len(undelivered) == 2
+    assert {row["video_id"] for row in undelivered} == {"vid-1", "vid-3"}
     assert undelivered[0]["has_transcript"] is True
-    assert undelivered[0]["pending_article_json"] == '{"id": "vid-1"}'
-    assert undelivered[0]["indexed_at"] is None
+    assert {row["pending_article_json"] for row in undelivered} == {'{"id": "vid-1"}', '{"id": "vid-3"}'}
+    assert all(row["indexed_at"] in {None, "2026-09-18T10:05:00Z"} for row in undelivered)
+
+    store.connection.execute("UPDATE processed_videos SET review_state = 'revision_needed' WHERE video_id = 'vid-1'")
+    assert [row["video_id"] for row in store.undelivered_with_transcript()] == ["vid-3"]
 
     # Mark vid-1 as indexed
     store.mark_indexed("vid-1")
-    assert len(store.undelivered_with_transcript()) == 0
+    assert [row["video_id"] for row in store.undelivered_with_transcript()] == ["vid-3"]
