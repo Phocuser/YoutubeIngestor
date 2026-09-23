@@ -1,5 +1,5 @@
-"""Resumable channel backfill: enumerate a channel, fetch timed transcripts, cut the
-ad reads, and deliver the spoken text to Mycelium (Postgres + indexer).
+"""Resumable channel backfill: enumerate a channel, fetch timed transcripts, and
+deliver a reversible caption capture to Mycelium.
 
     python -m app.backfill [--limit N] [--max-hours H] [--channels @handle,...]
 
@@ -21,13 +21,12 @@ from typing import Any, Callable, Dict, List, Optional
 from . import channel_videos, sponsor
 from .backfill_store import BackfillStore
 from .config import Settings
-from .models import timed_track
-from .mycelium_pg import ALREADY_PRESENT, QUARANTINED, MyceliumPg, article_uuid
+from .capture import build_capture
+from .mycelium_pg import ALREADY_PRESENT, QUARANTINED, MyceliumPg
 from .youtube_client import TranscriptBlocked, fetch_timed_transcript
 
 LOGGER = logging.getLogger(__name__)
 
-MIN_WORDS = 60
 BLOCK_BACKOFF_SECONDS = (300, 900, 1800, 1800, 3600)
 
 
@@ -78,7 +77,7 @@ class Backfill:
         list_videos: Callable = channel_videos.list_channel_videos,
         fetch_meta: Callable = channel_videos.fetch_video_meta,
         fetch_transcript: Callable = fetch_timed_transcript,
-        clean: Callable = sponsor.clean_transcript,
+        clean: Callable | None = None,
         index: Callable | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -201,58 +200,18 @@ class Backfill:
                 self.store.mark_error(video_id, "malformed_or_empty_timed_captions")
                 summary.errors += 1
                 return True
-            track = timed_track(video_id, raw, track_id="backfill", language="unknown", caption_kind="unknown", source_metadata={"provider": "youtube"})
-            if any(s.start_ms is None or s.end_ms is None for s in track.segments):
-                # Unknown timing is evidence, not a zero timestamp.  Keep the
-                # source intact and expose the unresolved ad boundary for a
-                # later mapped review.
-                cleaned = sponsor.CleanResult(
-                    text=" ".join(s.text for s in track.segments), removed_seconds=0.0,
-                    removed_snippets=0, total_snippets=len(track.segments),
-                    sources=["timing_unknown"], ranges=[],
-                    decisions=[{"segment_index": i, "decision": "uncertain",
-                                "reason": "caption_timing_unknown", "source": "none"}
-                               for i, _ in enumerate(track.segments)],
-                )
-            else:
-                snippets = [sponsor.Snippet(text=s.text, start=s.start_ms / 1000.0,
-                                            duration=(s.end_ms - s.start_ms) / 1000.0)
-                            for s in track.segments]
-                cleaned = self._clean(snippets, video_id)
-            if len(cleaned.text.split()) < MIN_WORDS:
-                self.store.mark_no_transcript(video_id, meta.published_at or None)
-                summary.no_transcript += 1
-                return True
-
-            envelope = {
-                "id": article_uuid(video_id),
-                "name": meta.title or row["title"],
-                "source_agency": meta.channel_name or "YouTube",
-                "published_at": meta.published_at,
-                "raw_content": cleaned.text,
-                "caption_track": track.to_dict(),
-                "cleaning": {"policy_version": cleaned.policy_version, "decisions": cleaned.decisions or [],
-                              "ranges": [list(r) for r in cleaned.ranges], "sources": list(cleaned.sources)},
-            }
-            metadata = {
-                "video_id": video_id,
-                "title": meta.title or row["title"],
-                "channel_name": meta.channel_name,
-                "channel_id": meta.channel_id,
-                "duration": meta.duration,
-                "transcript_source": "youtube-captions",
-                "ads_removed_seconds": round(cleaned.removed_seconds, 1),
-                "ads_removed_snippets": cleaned.removed_snippets,
-                "ad_removal_sources": cleaned.sources,
-                "ad_ranges": [list(r) for r in cleaned.ranges],
-                "ad_decisions": cleaned.decisions or [],
-                "ad_policy_version": cleaned.policy_version,
-            }
+            envelope, metadata = build_capture(
+                video_id, raw, title=meta.title or row["title"],
+                channel_id=meta.channel_id or row["channel_id"],
+                channel_name=meta.channel_name or "YouTube",
+                published_at=meta.published_at, cleaner=self._clean,
+                duration=meta.duration,
+            )
             self.store.mark_done(
                 video_id, meta.published_at, envelope["id"], json.dumps(envelope), json.dumps(metadata)
             )
             summary.done += 1
-            summary.ads_removed_seconds += cleaned.removed_seconds
+            summary.ads_removed_seconds += float(metadata["ads_removed_seconds"])
             fresh = self.store.get(video_id)
             self._deliver_pg(fresh, summary)
         except Exception as exc:  # noqa: BLE001 - one bad video must not stop the night
@@ -297,7 +256,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-hours", type=float, default=0.0, help="stop after H hours")
     parser.add_argument("--channels", default="", help="comma-separated @handles/UC ids (default: BACKFILL_CHANNELS)")
     parser.add_argument("--no-discover", action="store_true", help="skip re-listing the channel(s)")
-    parser.add_argument("--no-postgres", action="store_true", help="skip the Postgres write (indexer only)")
+    parser.add_argument("--no-postgres", action="store_true", help="legacy compatibility flag; disable the durable capture boundary")
     parser.add_argument("--delay-min", type=float, default=12.0, help="min seconds between videos")
     parser.add_argument("--delay-max", type=float, default=20.0, help="max seconds between videos")
     parser.add_argument("--stats", action="store_true")

@@ -1,6 +1,9 @@
 # mycelium-youtube-captions
 
-Ingestion service for YouTube channel videos and captions, normalizing transcripts into Mycelium Article envelopes and feeding them into Mycelium's `cmd/indexer` extraction pipeline with retryable delivery tracking.
+Ingestion service for YouTube channel videos and timed captions. Polling and
+backfill produce the same reversible capture envelope and submit it through
+Mycelium's durable capture boundary. This service does not own a graph UUID,
+Postgres schema, Redis stream, extraction worker, or indexer process.
 
 ---
 
@@ -10,15 +13,13 @@ Ingestion service for YouTube channel videos and captions, normalizing transcrip
 > **This service does nothing until `YOUTUBE_CHANNEL_IDS` is explicitly configured.**
 > By default, `YOUTUBE_CHANNEL_IDS` is empty. Which channels to monitor is an operator decision. Without configured channel IDs, the polling loop runs without performing any network fetches or recording any videos.
 
-> [!WARNING]
-> **Entity Dictionary Coverage Limitation**:
-> `INDEXER_DICT_PATH` defaults to `../mycelium/testdata/entity_dict.json` (a small working test fixture) rather than `mycelium/fixtures/entity_dictionary.json`. The large dictionary fixture is currently in the wrong JSON shape for `cmd/indexer -dict` and has unresolved duplicate-key data-quality issues upstream in Mycelium. Until Mycelium's duplicate-key data issue is resolved separately, extraction coverage is intentionally limited to the small test fixture to guarantee clean CLI execution. `mycelium/seeds/incident_markers.json` is the confirmed, working markers file.
 
 ---
 
 ## Purpose & How It Fits Into Mycelium
 
-Mycelium extracts events, entities, and relationships from unstructured texts using a deterministic scanner and Aho-Corasick automata (implemented in `cmd/indexer/pipeline.go`).
+Mycelium may extract events, entities, and relationships downstream. This
+adapter only captures source evidence and metadata.
 
 The pipeline expects incoming articles matching the `Article` shape:
 ```json
@@ -37,9 +38,9 @@ This service:
 3. For each unseen video, fetches transcripts using `youtube-transcript-api` (both manual and auto-generated captions).
 4. If captions exist, normalizes the video into the `Article` JSON shape and stores it in the `pending_article_json` column.
 5. If captions do not exist (a common case for music, silent clips, or disabled captions), records the video with `has_transcript = 0` so it is not polled or retried forever.
-6. Genuine network or API errors propagate without recording the video, enabling automated retry on subsequent poll cycles.
-7. Executes `cmd/indexer` as a subprocess (`[indexer_bin, "-dict", dict_path, "-markers", markers_path, "-redis-addr", redis_addr]`), streaming the normalized `Article` JSON via stdin. On returncode 0, marks `indexed_at` timestamp.
-8. Runs a retry sweep at the start of each poll cycle to re-attempt any unindexed articles (`has_transcript = 1 AND indexed_at IS NULL`), wrapped so sweep failures never block polling for new videos.
+6. Genuine network or API errors record a retryable caption gap, enabling automated retry on subsequent poll cycles without claiming successful processing.
+7. Submits the canonical timed track through the shared durable capture receipt boundary. Failed delivery remains in a retryable local spool.
+8. Keeps ad, self-promo, and interaction decisions as a versioned derived view. Raw timed captions are never deleted or overwritten; changed bodies are quarantined.
 
 ---
 
@@ -52,10 +53,8 @@ This service:
 | `DATABASE_PATH` | `string` | `data/youtube_captions.sqlite3` | SQLite database path for state and deduplication. |
 | `SERVICE_HOST` | `string` | `0.0.0.0` | Bind host for HTTP service. |
 | `SERVICE_PORT` | `int` | `8083` | Bind port for HTTP service. |
-| `INDEXER_BIN` | `string` | `../mycelium/bin/indexer` | Path to mycelium `cmd/indexer` Go CLI binary. |
-| `INDEXER_DICT_PATH` | `string` | `../mycelium/testdata/entity_dict.json` | Path to entity dictionary JSON fixture (see dictionary coverage limitation note above). |
-| `INDEXER_MARKERS_PATH` | `string` | `../mycelium/seeds/incident_markers.json` | Path to incident markers JSON seed file. |
-| `MYCELIUM_REDIS_ADDR` | `string` | `127.0.0.1:6381` | Redis host:port for mycelium candidate stream publishing (default 6381 matches docker-compose). |
+| `MYCELIUM_PG_URL` | `string` | unset | Explicit opt-in durable Mycelium Postgres URL. When unset or blank, submission is disabled and no Mycelium database is opened. |
+| `MYCELIUM_DIR` | `string` | `../mycelium` | Filesystem path used by the Mycelium adapter if `MYCELIUM_PG_URL` is explicitly configured; this setting alone never enables database access. |
 
 ---
 
@@ -124,7 +123,12 @@ scripts/overnight.sh                                # everything, re-running thr
 .venv/bin/python -m app.backfill --stats            # progress
 ```
 
-Flow: `yt-dlp` lists the channel (`BACKFILL_CHANNELS`, default `@warographics643` = WarFronts; the channel's Atom feed 404s) -> per video, timed captions via `youtube-transcript-api` -> **ad reads / self-promo cut** (`app/sponsor.py`) -> Mycelium Postgres `articles` (`source_id = yt:<video_id>`, `source_agency` = channel name, via Mycelium's `ArticleStore`) and `cmd/indexer` -> Redis. Postgres `id` and the indexer `id` are the same UUIDv5 so `event_nodes.article_id` resolves.
+Flow: `yt-dlp` lists the channel -> timed captions are normalized by the same
+shared builder used by polling -> a versioned editorial view records any
+SponsorBlock/heuristic decisions and ranges without removing source segments ->
+the durable Mycelium capture receipt boundary accepts the evidence. The source
+alias is `youtube:<video_id>`; it is not a graph UUID. Backfill completion is
+not proof that downstream indexing has completed.
 
 Ad removal: SponsorBlock's community segments (`sponsor`, `selfpromo`, `interaction`) are used when they exist; otherwise a conservative keyword heuristic anchored on the spoken transitions ("before we go any further" ... "let's get back to"). What was removed is recorded per article in `metadata` (`ads_removed_seconds`, `ad_removal_sources`).
 

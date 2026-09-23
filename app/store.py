@@ -24,6 +24,7 @@ class CaptionsStore:
                     processed_at TEXT NOT NULL,
                     has_transcript BOOLEAN NOT NULL,
                     pending_article_json TEXT DEFAULT NULL,
+                    pending_metadata_json TEXT DEFAULT NULL,
                     persisted_at TEXT DEFAULT NULL,
                     indexed_at TEXT DEFAULT NULL,
                     review_state TEXT NOT NULL DEFAULT 'ready',
@@ -58,10 +59,14 @@ class CaptionsStore:
                 self.connection.execute("ALTER TABLE processed_videos ADD COLUMN review_state TEXT NOT NULL DEFAULT 'ready'")
             if "review_reason" not in cols:
                 self.connection.execute("ALTER TABLE processed_videos ADD COLUMN review_reason TEXT")
+            if "pending_metadata_json" not in cols:
+                self.connection.execute("ALTER TABLE processed_videos ADD COLUMN pending_metadata_json TEXT DEFAULT NULL")
 
     def is_processed(self, video_id: str) -> bool:
         cursor = self.connection.execute(
-            "SELECT 1 FROM processed_videos WHERE video_id = ?",
+            """SELECT 1 FROM processed_videos
+               WHERE video_id = ? AND review_state = 'ready'
+                 AND (has_transcript = 1 OR review_reason IS NULL)""",
             (video_id,),
         )
         return cursor.fetchone() is not None
@@ -74,10 +79,24 @@ class CaptionsStore:
         published_at: str,
         has_transcript: bool,
         pending_article_json: Optional[str] = None,
+        pending_metadata_json: Optional[str] = None,
         indexed_at: Optional[str] = None,
     ) -> bool:
         existing = self.get_video(video_id)
         if existing:
+            if existing.get("review_state") == "retryable":
+                now = datetime.now(timezone.utc).isoformat()
+                with self.connection:
+                    self.connection.execute(
+                        """UPDATE processed_videos SET channel_id=?, title=?, published_at=?,
+                           processed_at=?, has_transcript=?, pending_article_json=?,
+                           pending_metadata_json=?, persisted_at=NULL, review_state='ready',
+                           review_reason=NULL WHERE video_id=?""",
+                        (channel_id, title, published_at or now, now,
+                         1 if has_transcript else 0, pending_article_json,
+                         pending_metadata_json, video_id),
+                    )
+                return True
             old = json.loads(existing.get("pending_article_json") or "{}").get("raw_content", "")
             new = json.loads(pending_article_json or "{}").get("raw_content", "")
             if old == new:
@@ -93,8 +112,8 @@ class CaptionsStore:
             self.connection.execute(
                 """
                 INSERT INTO processed_videos (
-                    video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     video_id,
@@ -104,10 +123,27 @@ class CaptionsStore:
                     now,
                     1 if has_transcript else 0,
                     pending_article_json,
+                    pending_metadata_json,
                     indexed_at,
                 ),
             )
         return True
+
+    def record_gap(self, video_id: str, channel_id: str, title: str, published_at: str,
+                   reason: str) -> None:
+        """Persist a retryable caption gap without claiming successful processing."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO processed_videos
+                   (video_id, channel_id, title, published_at, processed_at, has_transcript,
+                    review_state, review_reason)
+                   VALUES (?, ?, ?, ?, ?, 0, 'retryable', ?)
+                   ON CONFLICT(video_id) DO UPDATE SET
+                     processed_at=excluded.processed_at, has_transcript=0,
+                     review_state='retryable', review_reason=excluded.review_reason""",
+                (video_id, channel_id, title, published_at or now, now, reason),
+            )
 
     def mark_indexed(self, video_id: str, indexed_at: Optional[str] = None) -> None:
         now = indexed_at or datetime.now(timezone.utc).isoformat()
@@ -128,7 +164,7 @@ class CaptionsStore:
     def undelivered_with_transcript(self, limit: int = 25) -> List[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, persisted_at, indexed_at, review_state, review_reason
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, review_state, review_reason
             FROM processed_videos
             WHERE has_transcript = 1
               AND persisted_at IS NULL
@@ -148,7 +184,7 @@ class CaptionsStore:
     def get_video(self, video_id: str) -> Optional[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, persisted_at, indexed_at, review_state, review_reason
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, review_state, review_reason
             FROM processed_videos
             WHERE video_id = ?
             """,

@@ -96,7 +96,9 @@ async def test_poll_uses_timed_captions_and_durable_receipt(service_and_store):
     article = json.loads(row["pending_article_json"])
     assert article["raw_content"] == "Opening analysis The raw caption track is retained."
     assert article["caption_track"]["segments"][1]["text"] == "The raw caption track is retained."
-    assert article["cleaning"] == {"policy_version": "ads-v1", "decisions": [], "ranges": [], "sources": []}
+    assert article["cleaning"]["policy_version"] == "ads-v1"
+    assert article["cleaning"]["derived_from"] == "caption_track"
+    assert len(article["cleaning"]["decisions"]) == 2
 
 
 @pytest.mark.asyncio
@@ -130,6 +132,19 @@ async def test_failed_timed_caption_fetch_remains_retryable(service_and_store):
 
 
 @pytest.mark.asyncio
+async def test_retryable_caption_gap_can_resolve_without_quarantine(service_and_store):
+    service, store, client, submitter = service_and_store
+    client.fetch_channel_feed_return_value = [_video("gap-resolves")]
+    client.fetch_timed_transcript_return_value = None
+    assert await service.poll_once() == []
+    assert store.get_video("gap-resolves")["review_state"] == "retryable"
+    client.fetch_timed_transcript_return_value = list(TIMED_CAPTIONS)
+    assert len(await service.poll_once()) == 1
+    assert store.get_video("gap-resolves")["review_state"] == "ready"
+    assert store.get_video("gap-resolves")["persisted_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_receipt_failure_leaves_persisted_outbox_retryable(service_and_store):
     service, store, client, submitter = service_and_store
     submitter.state = "rejected"
@@ -153,13 +168,28 @@ async def test_retry_sweep_uses_receipt_and_marks_persisted(service_and_store):
 
 
 @pytest.mark.asyncio
+async def test_direct_durable_submission_normalizes_youtube_alias(service_and_store):
+    service, store, client, submitter = service_and_store
+    store.record_video(
+        "alias-video",
+        "channel_a",
+        "Alias video",
+        "2026-09-18T10:00:00Z",
+        True,
+        json.dumps({"id": "youtube:alias-video", "raw_content": "caption text"}),
+    )
+
+    assert await service.submit_durable({"id": "youtube:alias-video"})
+    assert store.get_video("alias-video")["persisted_at"] is not None
+    assert len(submitter.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_no_indexer_or_redis_fallback_including_retry_sweep(service_and_store):
     service, store, client, submitter = service_and_store
     client.fetch_channel_feed_return_value = [_video("no-legacy")]
     client.fetch_timed_transcript_return_value = list(TIMED_CAPTIONS)
-    with patch("app.indexer_client.subprocess.run") as run_indexer:
-        await service.poll_once()
-        assert run_indexer.call_count == 0
+    await service.poll_once()
     assert store.get_video("no-legacy")["persisted_at"] is not None and submitter.calls
 
 

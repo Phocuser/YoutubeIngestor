@@ -3,7 +3,10 @@ from datetime import datetime
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-import yt_dlp
+try:  # Keep entrypoint imports clean when the optional provider tool is absent.
+    import yt_dlp
+except ImportError:  # pragma: no cover - exercised by dependency-free smoke tests
+    yt_dlp = None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +70,8 @@ def list_channel_videos(
         "no_warnings": True,
         "skip_download": True,
     }
+    if ydl_factory is None and yt_dlp is None:
+        raise RuntimeError("yt-dlp dependency is required for channel discovery")
     factory = ydl_factory or yt_dlp.YoutubeDL
     with factory(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -126,6 +131,8 @@ def fetch_video_meta(
         "skip_download": True,
     }
     url = f"https://www.youtube.com/watch?v={video_id}"
+    if ydl_factory is None and yt_dlp is None:
+        raise RuntimeError("yt-dlp dependency is required for video metadata")
     factory = ydl_factory or yt_dlp.YoutubeDL
     with factory(opts) as ydl:
         info = ydl.extract_info(url, download=False) or {}

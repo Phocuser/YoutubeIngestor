@@ -27,7 +27,7 @@ def reindex(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="app.reindex", description="Re-scan stored articles through indexer")
+    parser = argparse.ArgumentParser(prog="app.reindex", description="Disabled legacy indexer compatibility command")
     parser.add_argument("--limit", type=int, default=0, help="maximum number of videos to re-index")
     parser.add_argument("--no-drain", action="store_true", help="skip draining candidate worker")
     args = parser.parse_args(argv)

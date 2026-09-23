@@ -19,19 +19,10 @@ class Settings:
     database_path: str = os.getenv("DATABASE_PATH", "data/youtube_captions.sqlite3")
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8083"))
-    indexer_bin: str = os.getenv("INDEXER_BIN", "../mycelium/bin/indexer")
-    indexer_dict_path: str = os.getenv(
-        "INDEXER_DICT_PATH", "../mycelium/testdata/entity_dict.json"
+    mycelium_pg_url: str = field(
+        default_factory=lambda: os.getenv("MYCELIUM_PG_URL", "")
     )
-    indexer_markers_path: str = os.getenv(
-        "INDEXER_MARKERS_PATH", "../mycelium/seeds/incident_markers.json"
-    )
-    mycelium_redis_addr: str = os.getenv("MYCELIUM_REDIS_ADDR", "127.0.0.1:6381")
-    mycelium_pg_url: str = os.getenv(
-        "MYCELIUM_PG_URL",
-        "postgres://intel_admin:mycelium_local_dev_password@127.0.0.1:5434/intel_graph",
-    )
-    mycelium_dir: str = os.getenv("MYCELIUM_DIR", "../mycelium")
+    mycelium_dir: str = field(default_factory=lambda: os.getenv("MYCELIUM_DIR", "../mycelium"))
     backfill_channels: list[str] = field(
         default_factory=lambda: _parse_channel_ids(
             os.getenv("BACKFILL_CHANNELS", "@warographics643,@HomeFronts")

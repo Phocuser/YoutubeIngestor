@@ -111,7 +111,7 @@ class BackfillStore:
                     """
                     SELECT * FROM backfill_videos
                     WHERE review_state = 'ready'
-                      AND (status = 'pending' OR (status = 'error' AND attempts < ?))
+                      AND (status = 'pending' OR (status IN ('no_transcript', 'error') AND attempts < ?))
                     ORDER BY created_at ASC, rowid ASC
                     LIMIT ?
                     """,
@@ -122,7 +122,7 @@ class BackfillStore:
                     """
                     SELECT * FROM backfill_videos
                     WHERE review_state = 'ready'
-                      AND (status = 'pending' OR (status = 'error' AND attempts < ?))
+                      AND (status = 'pending' OR (status IN ('no_transcript', 'error') AND attempts < ?))
                     ORDER BY created_at ASC, rowid ASC
                     """,
                     (max_attempts,),

@@ -20,20 +20,29 @@ LOGGER = logging.getLogger("mycelium-youtube-captions")
 settings = Settings()
 store = CaptionsStore(settings.database_path)
 client = YouTubeClient()
-submitter = MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
+submitter = None
+if settings.mycelium_pg_url.strip():
+    try:
+        submitter = MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
+    except (ImportError, ModuleNotFoundError) as exc:
+        # Keep the HTTP entrypoint importable in adapter-only/test environments;
+        # delivery remains disabled until the explicit Mycelium boundary exists.
+        LOGGER.warning("Mycelium capture boundary unavailable: %s", exc)
 service = CaptionsService(settings, store, client, submitter)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start polling loop task in background
-    poll_task = asyncio.create_task(service.run_loop())
+    # A missing durable boundary is an explicit disabled state, not a reason
+    # to start a poll loop that can only accumulate undeliverable work.
+    poll_task = asyncio.create_task(service.run_loop()) if service.submitter is not None else None
     yield
-    poll_task.cancel()
-    try:
-        await poll_task
-    except asyncio.CancelledError:
-        pass
+    if poll_task is not None:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

@@ -1,5 +1,4 @@
-"""Persist video transcripts into Mycelium's Postgres ``articles`` via its typed
-persistence layer (imported from the Mycelium checkout, so no SQL lives here)."""
+"""Submit YouTube caption captures through Mycelium's typed receipt boundary."""
 import logging
 import sys
 import uuid
@@ -8,6 +7,8 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
+
+from .capture import canonical_timed_bytes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +44,17 @@ class MyceliumPg:
         from contracts.capture import Submission  # noqa: PLC0415
         from persistence.ingest import admit  # noqa: PLC0415
         video_id = str(metadata["video_id"])
-        raw = str(envelope["raw_content"]).encode("utf-8")
+        track = envelope.get("raw_timed_captions") or envelope.get("caption_track")
+        if not track:
+            raise ValueError("capture requires raw timed captions")
+        # The durable evidence is the canonical timed track, not a derived
+        # editorial string.  This preserves exact UTF-8 bytes and ordering.
+        from .models import CaptionTrack, TimedCaption
+        segments = tuple(TimedCaption(**segment) for segment in track["segments"])
+        raw_track = CaptionTrack(track["video_id"], track["track_id"], track["language"],
+                                  track["caption_kind"], segments,
+                                  track.get("source_metadata", {}), track.get("coverage_state", "complete"))
+        raw = canonical_timed_bytes(raw_track)
         digest = hashlib.sha256(raw).hexdigest()
         submission = Submission(
             schema_version="capture.v1", submission_id=uuid.uuid4(), idempotency_key=f"youtube:{video_id}:{digest}",
@@ -52,7 +63,9 @@ class MyceliumPg:
             metadata={**metadata, "video_id": video_id, "source_alias": f"youtube:{video_id}",
                       "content_scope": "full_text", "access_state": "allowed",
                       "caption_track": envelope.get("caption_track"),
-                      "cleaning": envelope.get("cleaning", {})},
+                      "cleaning": envelope.get("cleaning", {}),
+                      "raw_timed_sha256": digest, "raw_timed_byte_length": len(raw),
+                      "raw_timed_encoding": "utf-8"},
             capture={"capture_type": "supplied_capture", "content_base64": base64.b64encode(raw).decode("ascii"), "byte_length": len(raw), "sha256": digest, "media_type": "text/plain", "retrieval_metadata": {"provider": "youtube", "video_id": video_id}},
         )
         return admit(self._db, submission, principal_id="youtube-adapter")

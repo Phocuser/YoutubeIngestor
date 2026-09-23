@@ -72,8 +72,7 @@ def test_happy_path(tmp_path):
     row = store.get("vid00000001")
     assert summary.done == 1 and row["status"] == "done"
     assert row["persisted_at"] is not None
-    expected_id = article_uuid("vid00000001")
-    assert pg.calls[0][0]["id"] == expected_id
+    assert pg.calls[0][0]["id"] == "youtube:vid00000001"
     assert pg.calls[0][0]["source_agency"] == "WarFronts"
     assert pg.calls[0][0]["published_at"] == "2026-09-15T00:00:00Z"
     metadata = pg.calls[0][1]
@@ -89,7 +88,7 @@ def test_ad_text_removed(tmp_path):
     clean = functools.partial(clean_transcript, fetch=lambda v: [(10.0, 20.0)], use_heuristic=False)
     b, _, pg, _ = make_backfill(tmp_path, fetch_transcript=lambda v: raw, clean=clean)
     summary = b.run(["@x"])
-    content = pg.calls[0][0]["raw_content"]
+    content = pg.calls[0][0]["editorial_content"]
     assert "premium subscriber site" not in content
     assert "before ad story headline" in content and "after ad story continuation" in content
     assert summary.ads_removed_seconds > 0
@@ -102,10 +101,10 @@ def test_no_transcript_and_short_transcript(tmp_path):
         tmp_path, list_videos=lambda h: videos, fetch_transcript=lambda v: transcripts[v]
     )
     summary = b.run(["@x"])
-    assert summary.no_transcript == 2
+    assert summary.no_transcript == 1
     assert store.get("v1")["status"] == "no_transcript"
-    assert store.get("v2")["status"] == "no_transcript"
-    assert len(pg.calls) == 0 and len(indexer.calls) == 0
+    assert store.get("v2")["status"] == "done"
+    assert len(pg.calls) == 1 and len(indexer.calls) == 0
 
 
 def test_throttled_backoff_then_success(tmp_path):

@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from .config import Settings
-from .models import timed_track
+from .capture import build_capture
 from .store import CaptionsStore
 from .youtube_client import YouTubeClient
 
@@ -40,10 +40,17 @@ class CaptionsService:
     async def submit_durable(
         self, article: dict, video_id: Optional[str] = None
     ) -> bool:
-        target_id = video_id or article.get("id")
+        target_id = video_id
+        if target_id is None:
+            article_id = article.get("id")
+            target_id = (
+                article_id.removeprefix("youtube:")
+                if isinstance(article_id, str) and article_id.startswith("youtube:")
+                else article_id
+            )
         stored = self.store.get_video(target_id) if target_id else None
         if not stored or not stored.get("pending_article_json") or stored.get("review_state") != "ready":
-            LOGGER.warning("refusing indexer delivery before durable caption persistence for %s", target_id)
+            LOGGER.warning("refusing durable receipt submission before caption persistence for %s", target_id)
             return False
         try:
             article = json.loads(stored["pending_article_json"])
@@ -52,7 +59,8 @@ class CaptionsService:
             return False
         try:
             if self.submitter is not None:
-                receipt = await asyncio.to_thread(self.submitter.submit, article, {"video_id": target_id, "transcript_source": "youtube-captions"})
+                stored_metadata = json.loads(stored.get("pending_metadata_json") or "{}")
+                receipt = await asyncio.to_thread(self.submitter.submit, article, stored_metadata or {"video_id": target_id, "transcript_source": "youtube-captions"})
                 state = getattr(getattr(receipt, "state", None), "value", getattr(receipt, "state", None))
                 if state not in {"queued", "leased", "retry_wait", "succeeded"}:
                     return False
@@ -63,7 +71,7 @@ class CaptionsService:
             return False
         except Exception as exc:
             LOGGER.warning(
-                "Could not forward article to indexer for video %s: %s",
+                "Could not submit capture receipt for video %s: %s",
                 target_id,
                 exc,
             )
@@ -94,7 +102,7 @@ class CaptionsService:
                         await self.submit_durable(payload, video_id=video_id)
                 except Exception as item_err:
                     LOGGER.warning(
-                        "Failed retrying article indexing for %s: %s",
+                        "Failed retrying capture receipt for %s: %s",
                         item.get("video_id"),
                         item_err,
                     )
@@ -143,7 +151,9 @@ class CaptionsService:
                                 video_id,
                                 transcript_err,
                             )
-                            # Let genuine network error leave video unrecorded so it can be retried
+                            # Record a retryable gap without claiming successful processing.
+                            self.store.record_gap(video_id, actual_channel_id, title, published_at,
+                                                  f"caption_fetch_retryable:{type(transcript_err).__name__}")
                             continue
 
                         has_transcript = transcript is not None
@@ -152,26 +162,23 @@ class CaptionsService:
                         if has_transcript:
                             if not isinstance(transcript, (list, tuple)) or not transcript:
                                 LOGGER.warning("malformed or empty captions remain retryable for %s", video_id)
+                                self.store.record_gap(video_id, actual_channel_id, title, published_at,
+                                                      "caption_missing_or_malformed")
                                 continue
-                            track = timed_track(video_id, transcript, track_id="poll", language="unknown", caption_kind="unknown", source_metadata={"provider": "youtube"})
-                            if not any(segment.text for segment in track.segments):
+                            article, metadata = build_capture(
+                                video_id, transcript, title=title, channel_id=actual_channel_id,
+                                channel_name=channel_name, published_at=published_at,
+                            )
+                            if not any(segment["text"] for segment in article["caption_track"]["segments"]):
                                 LOGGER.warning("empty captions remain retryable for %s", video_id)
+                                self.store.record_gap(video_id, actual_channel_id, title, published_at,
+                                                      "caption_empty")
                                 continue
-                            # Confirmed Article shape from mycelium/cmd/indexer/pipeline.go
-                            article = {
-                                # youtube:<video_id> is a provider alias, not a
-                                # graph UUID. The central receipt assigns graph identity.
-                                "id": video_id,
-                                "name": title,
-                                "source_agency": channel_name,
-                                "published_at": published_at,
-                                "raw_content": " ".join(segment.text for segment in track.segments),
-                                "caption_track": track.to_dict(),
-                                "cleaning": {"policy_version": "ads-v1", "decisions": [], "ranges": [], "sources": []},
-                            }
                             pending_article_json = json.dumps(article)
                         else:
                             LOGGER.warning("missing timed captions remain retryable for %s", video_id)
+                            self.store.record_gap(video_id, actual_channel_id, title, published_at,
+                                                  "caption_missing")
                             continue
 
                         recorded = self.store.record_video(
@@ -181,6 +188,7 @@ class CaptionsService:
                             published_at=published_at,
                             has_transcript=has_transcript,
                             pending_article_json=pending_article_json,
+                            pending_metadata_json=json.dumps(metadata) if metadata else None,
                         )
                         if recorded:
                             processed_items.append(
