@@ -18,6 +18,7 @@ class VideoRef:
     video_id: str
     title: str
     duration: Optional[int]
+    published_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,14 @@ def list_channel_videos(
     handle_or_url: str,
     min_duration: int = 120,
     ydl_factory: Optional[Callable[..., Any]] = None,
+    limit: Optional[int] = None,
 ) -> List[VideoRef]:
     """Extract flat video references from a YouTube channel."""
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise ValueError("limit must be a positive integer when supplied")
+
     url = channel_url(handle_or_url)
     opts = {
         "extract_flat": True,
@@ -70,6 +77,8 @@ def list_channel_videos(
         "no_warnings": True,
         "skip_download": True,
     }
+    if limit is not None:
+        opts["playlistend"] = limit
     if ydl_factory is None and yt_dlp is None:
         raise RuntimeError("yt-dlp dependency is required for channel discovery")
     factory = ydl_factory or yt_dlp.YoutubeDL
@@ -80,21 +89,26 @@ def list_channel_videos(
     if not raw_entries:
         return []
 
-    flat_entries: List[Dict[str, Any]] = []
-    for entry in raw_entries:
-        if not isinstance(entry, dict):
-            continue
-        nested = entry.get("entries")
-        if isinstance(nested, list):
-            for sub in nested:
-                if isinstance(sub, dict):
-                    flat_entries.append(sub)
-        else:
-            flat_entries.append(entry)
+    def iter_flat_entries():
+        """Yield flat entries without retaining the provider listing."""
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("entries")
+            if isinstance(nested, list):
+                for sub in nested:
+                    if isinstance(sub, dict):
+                        yield sub
+            else:
+                yield entry
 
     seen_ids = set()
     results: List[VideoRef] = []
-    for entry in flat_entries:
+    raw_candidates = 0
+    for entry in iter_flat_entries():
+        if limit is not None and raw_candidates >= limit:
+            break
+        raw_candidates += 1
         vid_id = entry.get("id")
         if not vid_id:
             continue
@@ -115,7 +129,17 @@ def list_channel_videos(
 
         seen_ids.add(video_id)
         title = str(entry.get("title") or "").strip()
-        results.append(VideoRef(video_id=video_id, title=title, duration=dur_int))
+        published_at = _parse_upload_date(entry.get("upload_date")) or None
+        results.append(
+            VideoRef(
+                video_id=video_id,
+                title=title,
+                duration=dur_int,
+                published_at=published_at,
+            )
+        )
+        if limit is not None and len(results) >= limit:
+            break
 
     return results
 

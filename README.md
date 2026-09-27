@@ -119,9 +119,15 @@ PYTHONPATH=. pytest tests -v
 
 ```bash
 .venv/bin/python -m app.backfill --limit 5          # try a few
+.venv/bin/python -m app.backfill --limit 100 --backfill-days 30  # recent, bounded window
 scripts/overnight.sh                                # everything, re-running through throttling
 .venv/bin/python -m app.backfill --stats            # progress
 ```
+
+`--backfill-days` accepts 1–90 and requires `--limit` from 1–1000. Videos
+with missing or malformed publication dates are left unprocessed and make the
+run report incomplete; existing queued rows and delivery retries are filtered
+to the same date window.
 
 Flow: `yt-dlp` lists the channel -> timed captions are normalized by the same
 shared builder used by polling -> a versioned editorial view records any

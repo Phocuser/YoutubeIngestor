@@ -83,6 +83,7 @@ class BackfillStore:
         channel_id: str,
         title: str,
         duration: Optional[int] = None,
+        published_at: Optional[str] = None,
     ) -> bool:
         now = _now_iso()
         with self._lock:
@@ -93,16 +94,27 @@ class BackfillStore:
                         video_id,
                         channel_id,
                         title,
+                        published_at,
                         duration,
                         status,
                         attempts,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
                     """,
-                    (video_id, channel_id, title, duration, now, now),
+                    (video_id, channel_id, title, published_at, duration, now, now),
                 )
-                return cursor.rowcount > 0
+                inserted = cursor.rowcount > 0
+                if published_at is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE backfill_videos
+                        SET published_at = ?, updated_at = ?
+                        WHERE video_id = ?
+                        """,
+                        (published_at, now, video_id),
+                    )
+                return inserted
 
     def todo(self, limit: int = 0, max_attempts: int = 5) -> List[Dict[str, Any]]:
         with self._lock:
