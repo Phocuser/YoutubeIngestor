@@ -11,6 +11,8 @@ from youtube_transcript_api._errors import (
     TranslationLanguageNotAvailable,
 )
 
+from .transcript_http import TRANSCRIPT_HTTP_TIMEOUT_SECONDS, TranscriptTimeoutSession
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -119,12 +121,11 @@ def fetch_transcript(video_id: str) -> Optional[str]:
     Returns plain text joined transcript, or None if no captions/transcript exist.
     Genuine network/API errors propagate to caller.
     """
+    session = TranscriptTimeoutSession()
     try:
-        api = YouTubeTranscriptApi()
+        api = YouTubeTranscriptApi(http_client=session)
         if hasattr(api, "fetch"):
             data = api.fetch(video_id)
-        elif hasattr(YouTubeTranscriptApi, "get_transcript"):
-            data = YouTubeTranscriptApi.get_transcript(video_id)
         else:
             data = api.get_transcript(video_id)
     except NO_TRANSCRIPT_EXCEPTIONS:
@@ -140,6 +141,8 @@ def fetch_transcript(video_id: str) -> Optional[str]:
         ):
             return None
         raise
+    finally:
+        session.close()
 
     if not data:
         return None
@@ -172,8 +175,9 @@ def fetch_timed_transcript(
     Raises :class:`TranscriptBlocked` when YouTube throttles this IP, so callers can
     back off; other genuine errors propagate.
     """
+    session = TranscriptTimeoutSession()
     try:
-        data = YouTubeTranscriptApi().fetch(video_id, languages=list(languages))
+        data = YouTubeTranscriptApi(http_client=session).fetch(video_id, languages=list(languages))
     except NO_TRANSCRIPT_EXCEPTIONS:
         return None
     except Exception as exc:
@@ -183,6 +187,8 @@ def fetch_timed_transcript(
         if name in ("VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId"):
             return None
         raise
+    finally:
+        session.close()
     track = getattr(data, "snippets", data)
     rows = [(item.text, float(item.start), float(item.duration)) for item in track if item.text]
     return TimedTranscript(rows, track_id=str(getattr(data, "track_id", "unknown")),

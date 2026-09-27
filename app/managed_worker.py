@@ -12,18 +12,29 @@ from itertools import islice
 from typing import Any, Mapping
 
 from .capture import build_capture
+from .discovery_deadline import DiscoveryTimeout, MetadataTimeout, TranscriptTimeout, run_with_deadline
 from .managed_capture import managed_timed_capture
 from .managed_acquisition import DefaultYouTubeAcquisition
 from .managed_models import Acquisition, ItemOutcome, JobOutcome, error_code as _error_code, video_value as _video_value
-from .source_control import ControlPlane, ControlPlaneError, LeaseLost, LeaseResponseError, MyceliumSourceControlClient, SubmissionConflict, _lease_fields
+from .source_control import CONTROL_PLANE_TIMEOUT_SECONDS, ControlPlane, ControlPlaneError, LeaseLost, LeaseResponseError, MyceliumSourceControlClient, SubmissionConflict, _lease_fields
+
+MIN_LEASE_SECONDS = 60
+DISCOVERY_TIMEOUT_CAP_SECONDS = 30.0
+DISCOVERY_LEASE_FRACTION = 0.25
+TRANSCRIPT_TIMEOUT_CAP_SECONDS = 20.0
+METADATA_TIMEOUT_CAP_SECONDS = 20.0
+
+
+class LeaseBudgetExceeded(RuntimeError):
+    """The old lease is too close to expiry for another control request."""
 
 
 class ManagedYouTubeWorker:
     def __init__(self, control: ControlPlane, *, worker_id: str, acquisition: Acquisition | None = None, lease_seconds: int = 120, batch_limit: int = 1, clock: Any = time.monotonic, utc_now: Any = lambda: datetime.now(timezone.utc)):
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id is required")
-        if not 10 <= lease_seconds <= 600:
-            raise ValueError("lease_seconds must be between 10 and 600")
+        if not MIN_LEASE_SECONDS <= lease_seconds <= 600:
+            raise ValueError(f"lease_seconds must be between {MIN_LEASE_SECONDS} and 600")
         if isinstance(batch_limit, bool) or not isinstance(batch_limit, int) or batch_limit != 1:
             raise ValueError("batch_limit must be 1; process one leased job per pass")
         self.control, self.worker_id = control, worker_id
@@ -80,10 +91,24 @@ class ManagedYouTubeWorker:
 
     def _renew_if_due(self, job: Mapping[str, Any], last_renewed: float) -> float:
         """Renew before work if discovery or an item consumed half the lease."""
-        if self.clock() - last_renewed < self.lease_seconds / 2:
+        elapsed = self.clock() - last_renewed
+        if elapsed < self.lease_seconds / 2:
             return last_renewed
+        # The renewal request itself must finish before the old lease expires.
+        # The renewed lease then covers the submit and completion calls.
+        if elapsed + CONTROL_PLANE_TIMEOUT_SECONDS >= self.lease_seconds:
+            raise LeaseBudgetExceeded("lease lacks time for a safe renewal")
         self.control.renew_job(job, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
         return self.clock()
+
+    def _discovery_budget(self) -> float:
+        return min(DISCOVERY_TIMEOUT_CAP_SECONDS, self.lease_seconds * DISCOVERY_LEASE_FRACTION)
+
+    def _transcript_budget(self) -> float:
+        return min(TRANSCRIPT_TIMEOUT_CAP_SECONDS, self.lease_seconds * DISCOVERY_LEASE_FRACTION)
+
+    def _metadata_budget(self) -> float:
+        return min(METADATA_TIMEOUT_CAP_SECONDS, self.lease_seconds * DISCOVERY_LEASE_FRACTION)
 
     def process_job(self, job: Mapping[str, Any]) -> JobOutcome:
         job_id, _ = _lease_fields(job)
@@ -104,17 +129,23 @@ class ManagedYouTubeWorker:
         # consume the lease silently before the first metadata request.
         last_renewed = self.clock()
         try:
-            discovered = self.acquisition.list_videos(resource_ref, limit=max_items)
-            discovery_truncated = bool(getattr(discovered, "truncated", False))
-            videos = list(islice(iter(discovered), max_items + 1))
+            def discover_bounded() -> tuple[bool, list[Any]]:
+                discovered = self.acquisition.list_videos(resource_ref, limit=max_items)
+                return bool(getattr(discovered, "truncated", False)), list(islice(iter(discovered), max_items + 1))
+
+            discovery_truncated, videos = run_with_deadline(discover_bounded, self._discovery_budget())
+        except DiscoveryTimeout:
+            return self._complete(job, "failed", 0, "DISCOVERY_TIMEOUT", [], last_renewed=last_renewed)
         except Exception:
             try:
-                self._renew_if_due(job, last_renewed)
+                last_renewed = self._renew_if_due(job, last_renewed)
             except LeaseLost:
                 return JobOutcome(job_id, "lease_lost", 0, "LEASE_LOST", False, [])
             except ControlPlaneError:
                 return JobOutcome(job_id, "control_error", 0, "CONTROL_PLANE_ERROR", False, [])
-            return self._complete(job, "failed", 0, "DISCOVERY_FAILED", [])
+            except LeaseBudgetExceeded:
+                return JobOutcome(job_id, "lease_lost", 0, "LEASE_BUDGET_EXHAUSTED", False, [])
+            return self._complete(job, "failed", 0, "DISCOVERY_FAILED", [], last_renewed=last_renewed)
 
         try:
             last_renewed = self._renew_if_due(job, last_renewed)
@@ -122,23 +153,25 @@ class ManagedYouTubeWorker:
             return JobOutcome(job_id, "lease_lost", 0, "LEASE_LOST", False, [])
         except ControlPlaneError:
             return JobOutcome(job_id, "control_error", 0, "CONTROL_PLANE_ERROR", False, [])
+        except LeaseBudgetExceeded:
+            return JobOutcome(job_id, "lease_lost", 0, "LEASE_BUDGET_EXHAUSTED", False, [])
 
         videos = list(videos)
         if not videos:
-            return self._complete(job, "failed", 0, "NO_VIDEOS_FOUND", [])
+            return self._complete(job, "failed", 0, "NO_VIDEOS_FOUND", [], last_renewed=last_renewed)
         outcomes, processed = [], 0
         first_error = "ITEM_LIMIT_REACHED" if len(videos) > max_items or discovery_truncated else None
         seen_ids: set[str] = set()
         duplicates_skipped = 0
         for video in videos[:max_items]:
-            if self.clock() - last_renewed >= self.lease_seconds / 2:
-                try:
-                    self.control.renew_job(job, worker_id=self.worker_id, lease_seconds=self.lease_seconds)
-                    last_renewed = self.clock()
-                except LeaseLost:
-                    return JobOutcome(job_id, "lease_lost", processed, "LEASE_LOST", False, outcomes)
-                except ControlPlaneError:
-                    return JobOutcome(job_id, "control_error", processed, "CONTROL_PLANE_ERROR", False, outcomes)
+            try:
+                last_renewed = self._renew_if_due(job, last_renewed)
+            except LeaseLost:
+                return JobOutcome(job_id, "lease_lost", processed, "LEASE_LOST", False, outcomes)
+            except ControlPlaneError:
+                return JobOutcome(job_id, "control_error", processed, "CONTROL_PLANE_ERROR", False, outcomes)
+            except LeaseBudgetExceeded:
+                return JobOutcome(job_id, "lease_lost", processed, "LEASE_BUDGET_EXHAUSTED", False, outcomes)
             video_id = _video_value(video, "video_id")
             if not isinstance(video_id, str) or not video_id.strip():
                 first_error = first_error or "VIDEO_ID_INVALID"
@@ -150,14 +183,48 @@ class ManagedYouTubeWorker:
                 continue
             seen_ids.add(video_id)
             try:
-                meta = self.acquisition.fetch_meta(video_id)
+                try:
+                    meta = run_with_deadline(
+                        lambda: self.acquisition.fetch_meta(video_id),
+                        self._metadata_budget(),
+                        timeout_type=MetadataTimeout,
+                    )
+                except MetadataTimeout:
+                    first_error = first_error or "METADATA_TIMEOUT"
+                    outcomes.append(ItemOutcome(video_id, False, "METADATA_TIMEOUT"))
+                    return self._complete(
+                        job,
+                        "partial" if processed else "failed",
+                        processed,
+                        first_error,
+                        outcomes,
+                        duplicates_skipped,
+                        last_renewed,
+                    )
                 published_at = _video_value(video, "published_at") or _video_value(meta, "published_at")
                 date_reason = self._date_reason(published_at, now=now, backfill_days=backfill_days)
                 if date_reason is not None:
                     first_error = first_error or date_reason
                     outcomes.append(ItemOutcome(video_id, False, date_reason))
                     continue
-                transcript = self.acquisition.fetch_transcript(video_id)
+                try:
+                    transcript = run_with_deadline(
+                        lambda: self.acquisition.fetch_transcript(video_id),
+                        self._transcript_budget(),
+                        timeout_type=TranscriptTimeout,
+                    )
+                except TranscriptTimeout:
+                    first_error = first_error or "TRANSCRIPT_TIMEOUT"
+                    outcomes.append(ItemOutcome(video_id, False, "TRANSCRIPT_TIMEOUT"))
+                    return self._complete(
+                        job,
+                        "partial" if processed else "failed",
+                        processed,
+                        first_error,
+                        outcomes,
+                        duplicates_skipped,
+                        last_renewed,
+                    )
                 if not isinstance(transcript, (list, tuple)) or not transcript:
                     raise ValueError("CAPTIONS_MISSING")
                 envelope, metadata = build_capture(
@@ -166,6 +233,17 @@ class ManagedYouTubeWorker:
                     published_at=published_at, duration=_video_value(meta, "duration"), is_public_channel_feed=False,
                 )
                 capture, submit_metadata, _ = managed_timed_capture(envelope, metadata)
+                # Recheck immediately before the control-plane write. Provider
+                # work may have consumed the half-lease threshold since the
+                # per-item check at loop entry.
+                try:
+                    last_renewed = self._renew_if_due(job, last_renewed)
+                except LeaseLost:
+                    return JobOutcome(job_id, "lease_lost", processed, "LEASE_LOST", False, outcomes)
+                except ControlPlaneError:
+                    return JobOutcome(job_id, "control_error", processed, "CONTROL_PLANE_ERROR", False, outcomes)
+                except LeaseBudgetExceeded:
+                    return JobOutcome(job_id, "lease_lost", processed, "LEASE_BUDGET_EXHAUSTED", False, outcomes)
                 receipt = self.control.submit_capture(job, worker_id=self.worker_id, envelope=envelope, metadata=submit_metadata, idempotency_key=f"youtube:{video_id}:{capture['sha256']}")
                 if receipt.get("evidence_durable") is not True:
                     raise ValueError("CAPTURE_NOT_DURABLE")
@@ -173,10 +251,22 @@ class ManagedYouTubeWorker:
                 outcomes.append(ItemOutcome(video_id, True))
             except LeaseLost:
                 return JobOutcome(job_id, "lease_lost", processed, "LEASE_LOST", False, outcomes)
+            except TranscriptTimeout:
+                first_error = first_error or "TRANSCRIPT_TIMEOUT"
+                outcomes.append(ItemOutcome(video_id, False, "TRANSCRIPT_TIMEOUT"))
+                return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped, last_renewed)
+            except MetadataTimeout:
+                first_error = first_error or "METADATA_TIMEOUT"
+                outcomes.append(ItemOutcome(video_id, False, "METADATA_TIMEOUT"))
+                return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped, last_renewed)
+            except DiscoveryTimeout:
+                first_error = first_error or "TRANSCRIPT_TIMEOUT"
+                outcomes.append(ItemOutcome(video_id, False, "TRANSCRIPT_TIMEOUT"))
+                return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped, last_renewed)
             except SubmissionConflict:
                 first_error = first_error or "SUBMISSION_CONFLICT"
                 outcomes.append(ItemOutcome(video_id, False, "SUBMISSION_CONFLICT"))
-                return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped)
+                return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped, last_renewed)
             except ControlPlaneError:
                 return JobOutcome(job_id, "control_error", processed, "CONTROL_PLANE_ERROR", False, outcomes)
             except ValueError as exc:
@@ -188,10 +278,28 @@ class ManagedYouTubeWorker:
                 outcomes.append(ItemOutcome(video_id, False, "ITEM_FAILED"))
 
         if first_error is None:
-            return self._complete(job, "succeeded", processed, None, outcomes, duplicates_skipped)
-        return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped)
+            return self._complete(job, "succeeded", processed, None, outcomes, duplicates_skipped, last_renewed)
+        return self._complete(job, "partial" if processed else "failed", processed, first_error, outcomes, duplicates_skipped, last_renewed)
 
-    def _complete(self, job: Mapping[str, Any], status: str, processed: int, stop_reason: str | None, outcomes: list[ItemOutcome], duplicates_skipped: int = 0) -> JobOutcome:
+    def _complete(
+        self,
+        job: Mapping[str, Any],
+        status: str,
+        processed: int,
+        stop_reason: str | None,
+        outcomes: list[ItemOutcome],
+        duplicates_skipped: int = 0,
+        last_renewed: float | None = None,
+    ) -> JobOutcome:
+        if last_renewed is not None:
+            try:
+                self._renew_if_due(job, last_renewed)
+            except LeaseLost:
+                return JobOutcome(str(job["job_id"]), "lease_lost", processed, "LEASE_LOST", False, outcomes)
+            except ControlPlaneError:
+                return JobOutcome(str(job["job_id"]), "control_error", processed, "CONTROL_PLANE_ERROR", False, outcomes)
+            except LeaseBudgetExceeded:
+                return JobOutcome(str(job["job_id"]), "lease_lost", processed, "LEASE_BUDGET_EXHAUSTED", False, outcomes)
         try:
             self.control.complete_job(job, worker_id=self.worker_id, status=status, processed_items=processed, error_code=stop_reason)
         except LeaseLost:

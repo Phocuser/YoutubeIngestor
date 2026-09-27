@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-from .managed_worker import ControlPlaneError, LeaseLost, ManagedYouTubeWorker, MyceliumSourceControlClient
+from .managed_worker import ControlPlaneError, LeaseLost, MIN_LEASE_SECONDS, ManagedYouTubeWorker, MyceliumSourceControlClient
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not MIN_LEASE_SECONDS <= args.lease_seconds <= 600:
+        print(f"--lease-seconds must be between {MIN_LEASE_SECONDS} and 600", file=sys.stderr)
+        return 2
     if args.batch_limit != 1:
         print("--batch-limit must be 1; process one leased job per pass", file=sys.stderr)
         return 2

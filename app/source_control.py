@@ -6,6 +6,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .discovery_deadline import ControlPlaneTimeout, run_with_deadline
+
+CONTROL_PLANE_TIMEOUT_SECONDS = 5.0
+
 
 class LeaseLost(RuntimeError):
     """The control plane fenced this worker or its lease expired."""
@@ -92,10 +96,13 @@ def _validated_base_url(base_url: str) -> str:
 class MyceliumSourceControlClient:
     """Small HTTP client for the released managed YouTube job contract."""
 
-    def __init__(self, base_url: str, token: str, *, timeout: float = 20.0, client: httpx.Client | None = None):
+    def __init__(self, base_url: str, token: str, *, timeout: float = CONTROL_PLANE_TIMEOUT_SECONDS, client: httpx.Client | None = None):
         base_url = _validated_base_url(base_url)
         if not token.strip():
             raise ValueError("Mycelium source-control token is required")
+        if not 0 < timeout <= CONTROL_PLANE_TIMEOUT_SECONDS:
+            raise ValueError(f"control-plane timeout must be between 0 and {CONTROL_PLANE_TIMEOUT_SECONDS} seconds")
+        self._timeout = timeout
         self._client = client or httpx.Client(
             base_url=base_url, timeout=timeout,
             headers={"Authorization": f"Bearer {token}"},
@@ -108,7 +115,13 @@ class MyceliumSourceControlClient:
 
     def _post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         try:
-            response = self._client.post(path, json=dict(payload))
+            response = run_with_deadline(
+                lambda: self._client.post(path, json=dict(payload)),
+                self._timeout,
+                timeout_type=ControlPlaneTimeout,
+            )
+        except ControlPlaneTimeout as exc:
+            raise ControlPlaneError("control plane request exceeded its wall-clock deadline") from exc
         except httpx.HTTPError as exc:
             raise ControlPlaneError(f"control plane request failed: {type(exc).__name__}") from exc
         body = _response_payload(response)

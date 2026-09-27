@@ -116,6 +116,7 @@ def test_list_channel_videos_with_fixture():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": 15,
     }
     assert fake_factory.recorded_calls == [
         ("https://www.youtube.com/@warographics643/videos", False)
@@ -342,6 +343,7 @@ def test_fetch_video_meta():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": 15,
     }
     assert fake_factory.recorded_calls == [
         ("https://www.youtube.com/watch?v=G_9WlR5TAzk", False)

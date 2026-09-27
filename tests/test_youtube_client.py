@@ -8,6 +8,8 @@ from youtube_transcript_api._errors import (
 )
 
 from app.youtube_client import (
+    TRANSCRIPT_HTTP_TIMEOUT_SECONDS,
+    TranscriptTimeoutSession,
     fetch_channel_feed,
     fetch_transcript,
     parse_feed_xml,
@@ -111,9 +113,22 @@ def test_fetch_transcript_success():
     mock_api_instance = MagicMock()
     mock_api_instance.fetch.return_value = [snippet1, snippet2]
 
-    with patch("app.youtube_client.YouTubeTranscriptApi", return_value=mock_api_instance):
+    with patch("app.youtube_client.YouTubeTranscriptApi", return_value=mock_api_instance) as api:
         result = fetch_transcript("FVkp6tc2rNY")
         assert result == "Hello world. Welcome to the video."
+        session = api.call_args.kwargs["http_client"]
+        assert session.timeout == TRANSCRIPT_HTTP_TIMEOUT_SECONDS
+
+
+def test_fetch_transcript_legacy_instance_fallback_uses_injected_session():
+    class LegacyApi:
+        def get_transcript(self, video_id):
+            return [{"text": f"legacy {video_id}"}]
+
+    with patch("app.youtube_client.YouTubeTranscriptApi", return_value=LegacyApi()) as api:
+        assert fetch_transcript("legacy-video") == "legacy legacy-video"
+        session = api.call_args.kwargs["http_client"]
+        assert session.timeout == TRANSCRIPT_HTTP_TIMEOUT_SECONDS
 
 
 def test_fetch_transcript_no_transcript_disabled():
@@ -144,6 +159,17 @@ def test_fetch_transcript_genuine_error_propagates():
     with patch("app.youtube_client.YouTubeTranscriptApi", return_value=mock_api_instance):
         with pytest.raises(RequestBlocked):
             fetch_transcript("FVkp6tc2rNY")
+
+
+def test_transcript_session_sets_explicit_request_timeout_without_network():
+    session = TranscriptTimeoutSession()
+    response = MagicMock()
+    with patch("requests.Session.request", return_value=response) as request:
+        assert session.get("https://example.invalid/captions") is response
+        assert request.call_args.kwargs["timeout"] == TRANSCRIPT_HTTP_TIMEOUT_SECONDS
+        session.get("https://example.invalid/captions", timeout=2.5)
+        assert request.call_args.kwargs["timeout"] == 2.5
+    session.close()
 
 
 def test_youtube_client_wrapper():

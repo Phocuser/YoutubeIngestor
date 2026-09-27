@@ -11,6 +11,7 @@ except ImportError:  # pragma: no cover - exercised by dependency-free smoke tes
 LOGGER = logging.getLogger(__name__)
 
 UPCOMING_OR_LIVE_STATUSES = {"is_upcoming", "is_live", "post_live"}
+YTDLP_SOCKET_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ def list_channel_videos(
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
     }
     if limit is not None:
         opts["playlistend"] = limit
@@ -169,6 +171,7 @@ def fetch_video_meta(
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
     }
     url = f"https://www.youtube.com/watch?v={video_id}"
     if ydl_factory is None and yt_dlp is None:

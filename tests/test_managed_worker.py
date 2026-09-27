@@ -1,14 +1,22 @@
 import base64
+import hashlib
 import json
+import signal
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
+import pytest
 
 from app.managed_worker import (ControlPlaneError, LeaseLost, LeaseResponseError, ManagedYouTubeWorker,
                                 DefaultYouTubeAcquisition,
                                 SubmissionConflict,
                                 MyceliumSourceControlClient, managed_timed_capture)
+import app.discovery_deadline as discovery_deadline
+from app.discovery_deadline import DiscoveryTimeout, TranscriptTimeout, run_with_deadline
 
 
 TRACK = [
@@ -253,7 +261,7 @@ def test_empty_discovery_has_explicit_stop_reason():
 def test_renewal_happens_between_slow_items():
     control = FakeControl()
     acquisition = FakeAcquisition(videos=[Video("vid-1"), Video("vid-2")], transcripts={"vid-1": TRACK, "vid-2": TRACK})
-    ticks = iter([0.0, 0.0, 61.0, 61.0, 61.0])
+    ticks = iter([0.0, 0.0, 61.0, 61.0, 61.0, 61.0, 61.0, 61.0])
     outcome = ManagedYouTubeWorker(control, worker_id="yt-worker", acquisition=acquisition, lease_seconds=120, clock=lambda: next(ticks)).run_once()[0]
     assert outcome.status == "succeeded"
     assert len(control.renewals) == 1
@@ -285,6 +293,23 @@ def test_discovery_latency_renews_before_first_item():
     assert len(control.renewals) == 1
 
 
+def test_discovery_failure_preserves_renewed_clock_for_completion():
+    control = FakeControl()
+    ticks = iter([0.0, 61.0, 61.0, 61.0])
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=FakeAcquisition(fail_discovery=True),
+        lease_seconds=120,
+        clock=lambda: next(ticks),
+    ).run_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "DISCOVERY_FAILED"
+    assert outcome.completed
+    assert len(control.renewals) == 1
+    assert control.completions[0]["error_code"] == "DISCOVERY_FAILED"
+
+
 def test_worker_rejects_multi_job_batch_limit():
     try:
         ManagedYouTubeWorker(FakeControl(), worker_id="yt-worker", batch_limit=2)
@@ -292,6 +317,275 @@ def test_worker_rejects_multi_job_batch_limit():
         assert str(exc) == "batch_limit must be 1; process one leased job per pass"
     else:
         raise AssertionError("worker accepted a multi-job batch limit")
+
+
+def test_worker_rejects_lease_too_short_for_bounded_discovery():
+    try:
+        ManagedYouTubeWorker(FakeControl(), worker_id="yt-worker", lease_seconds=10)
+    except ValueError as exc:
+        assert str(exc) == "lease_seconds must be between 60 and 600"
+    else:
+        raise AssertionError("worker accepted an incompatible short lease")
+
+
+def test_blocked_discovery_times_out_without_submission(monkeypatch):
+    monkeypatch.setattr("app.managed_worker.DISCOVERY_TIMEOUT_CAP_SECONDS", 0.05)
+
+    class BlockedDiscovery(FakeAcquisition):
+        swallowed = False
+        completed = False
+
+        def list_videos(self, resource_ref, *, limit):
+            try:
+                time.sleep(0.5)
+            except Exception:
+                self.swallowed = True
+                return [Video("should-not-submit")]
+            self.completed = True
+            return super().list_videos(resource_ref, limit=limit)
+
+    control = FakeControl()
+    acquisition = BlockedDiscovery()
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=acquisition,
+        lease_seconds=60,
+    ).run_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "DISCOVERY_TIMEOUT"
+    assert control.submissions == []
+    assert control.completions[0]["status"] == "failed"
+    assert control.completions[0]["error_code"] == "DISCOVERY_TIMEOUT"
+    assert acquisition.swallowed is False
+    assert acquisition.completed is False
+
+
+def test_discovery_deadline_escapes_exception_handler_and_restores_alarm_state():
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    swallowed = False
+
+    def catches_ordinary_exceptions():
+        nonlocal swallowed
+        try:
+            while True:
+                time.sleep(0.01)
+        except Exception:
+            swallowed = True
+            return "incorrectly swallowed"
+
+    try:
+        try:
+            run_with_deadline(catches_ordinary_exceptions, 0.05)
+        except DiscoveryTimeout:
+            pass
+        else:
+            raise AssertionError("deadline cancellation was swallowed")
+        assert swallowed is False
+        assert signal.getsignal(signal.SIGALRM) is previous_handler
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
+def test_discovery_deadline_rejects_non_main_thread_before_operation():
+    started = []
+    errors = []
+
+    def operation():
+        started.append(True)
+
+    def run_from_thread():
+        try:
+            run_with_deadline(operation, 1.0)
+        except DiscoveryTimeout:
+            errors.append(True)
+
+    thread = threading.Thread(target=run_from_thread)
+    thread.start()
+    thread.join()
+    assert started == []
+    assert errors == [True]
+
+
+def test_discovery_deadline_preserves_remaining_prior_timer():
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.setitimer(signal.ITIMER_REAL, 0.30)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    try:
+        run_with_deadline(lambda: time.sleep(0.05), 0.5)
+        remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+        assert 0 < remaining < previous_timer[0]
+        assert interval == previous_timer[1]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def test_discovery_deadline_fails_closed_without_posix_alarm(monkeypatch):
+    started = []
+    monkeypatch.setattr(discovery_deadline, "_supports_posix_alarm", lambda: False)
+    with pytest.raises(DiscoveryTimeout):
+        run_with_deadline(lambda: started.append(True), 1.0)
+    assert started == []
+
+
+def test_transcript_timeout_finishes_item_without_submission():
+    acquisition = FakeAcquisition()
+    acquisition.fetch_transcript = lambda video_id: (_ for _ in ()).throw(
+        TranscriptTimeout("test timeout")
+    )
+    control = FakeControl()
+    outcome = ManagedYouTubeWorker(control, worker_id="yt-worker", acquisition=acquisition).run_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "TRANSCRIPT_TIMEOUT"
+    assert outcome.item_outcomes[0].stop_reason == "TRANSCRIPT_TIMEOUT"
+    assert control.submissions == []
+    assert control.completions[0]["status"] == "failed"
+    assert control.completions[0]["error_code"] == "TRANSCRIPT_TIMEOUT"
+
+
+def test_transcript_deadline_finishes_item_without_submission(monkeypatch):
+    acquisition = FakeAcquisition()
+    acquisition.fetch_transcript = lambda video_id: time.sleep(0.05)
+    control = FakeControl()
+    worker = ManagedYouTubeWorker(control, worker_id="yt-worker", acquisition=acquisition)
+    monkeypatch.setattr(worker, "_transcript_budget", lambda: 0.01)
+    outcome = worker.run_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "TRANSCRIPT_TIMEOUT"
+    assert outcome.item_outcomes[0].stop_reason == "TRANSCRIPT_TIMEOUT"
+    assert control.submissions == []
+
+
+def test_metadata_deadline_finishes_item_without_submission(monkeypatch):
+    acquisition = FakeAcquisition()
+    acquisition.fetch_meta = lambda video_id: time.sleep(0.05)
+    control = FakeControl()
+    worker = ManagedYouTubeWorker(control, worker_id="yt-worker", acquisition=acquisition)
+    monkeypatch.setattr(worker, "_metadata_budget", lambda: 0.01)
+    outcome = worker.run_once()[0]
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "METADATA_TIMEOUT"
+    assert outcome.item_outcomes[0].stop_reason == "METADATA_TIMEOUT"
+    assert control.submissions == []
+
+
+def test_renewal_loss_immediately_before_submit_prevents_submit():
+    class FakeClock:
+        values = iter([0.0, 0.0, 0.0, 30.0, 30.0, 30.0])
+
+        def __call__(self):
+            return next(self.values)
+
+    control = FakeControl(lease_lost_on_renew=True)
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=FakeAcquisition(),
+        lease_seconds=60,
+        clock=FakeClock(),
+    ).run_once()[0]
+    assert outcome.status == "lease_lost"
+    assert outcome.stop_reason == "LEASE_LOST"
+    assert control.submissions == []
+
+
+def test_unsafe_late_renewal_fails_without_completion_or_submission():
+    class FakeClock:
+        values = iter([0.0, 0.0, 0.0, 56.0])
+
+        def __call__(self):
+            return next(self.values)
+
+    control = FakeControl()
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=FakeAcquisition(),
+        lease_seconds=60,
+        clock=FakeClock(),
+    ).run_once()[0]
+    assert outcome.status == "lease_lost"
+    assert outcome.stop_reason == "LEASE_BUDGET_EXHAUSTED"
+    assert not outcome.completed
+    assert control.renewals == []
+    assert control.submissions == []
+    assert control.completions == []
+
+
+def test_late_completion_after_item_error_fails_without_completion():
+    class FakeClock:
+        values = iter([0.0, 0.0, 0.0, 56.0])
+
+        def __call__(self):
+            return next(self.values)
+
+    control = FakeControl()
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=FakeAcquisition(transcripts={"vid-1": None}),
+        lease_seconds=60,
+        clock=FakeClock(),
+    ).run_once()[0]
+    assert outcome.status == "lease_lost"
+    assert outcome.stop_reason == "LEASE_BUDGET_EXHAUSTED"
+    assert control.completions == []
+
+
+def test_submit_follows_immediate_successful_renewal():
+    class OrderedControl(FakeControl):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def renew_job(self, job, **kwargs):
+            self.events.append("renew")
+            return super().renew_job(job, **kwargs)
+
+        def submit_capture(self, job, **kwargs):
+            self.events.append("submit")
+            return super().submit_capture(job, **kwargs)
+
+    class FakeClock:
+        values = iter([0.0, 0.0, 0.0, 30.0, 30.0, 30.0])
+
+        def __call__(self):
+            return next(self.values)
+
+    control = OrderedControl()
+    outcome = ManagedYouTubeWorker(
+        control,
+        worker_id="yt-worker",
+        acquisition=FakeAcquisition(),
+        lease_seconds=60,
+        clock=FakeClock(),
+    ).run_once()[0]
+    assert outcome.status == "succeeded"
+    assert control.events == ["renew", "submit"]
+
+
+def test_control_request_has_hard_wall_clock_bound(monkeypatch):
+    client = httpx.Client(base_url="http://127.0.0.1")
+    control = MyceliumSourceControlClient("http://127.0.0.1", "source-token", timeout=0.01, client=client)
+
+    def trickle(*args, **kwargs):
+        time.sleep(0.10)
+
+    monkeypatch.setattr(client, "post", trickle)
+    started = time.monotonic()
+    with pytest.raises(ControlPlaneError, match="wall-clock deadline"):
+        control.lease_jobs(worker_id="worker", limit=1, lease_seconds=60)
+    assert time.monotonic() - started < 0.08
+    client.close()
+
+
+def test_control_timeout_above_lease_budget_bound_is_rejected():
+    with pytest.raises(ValueError, match="between 0 and 5.0 seconds"):
+        MyceliumSourceControlClient("http://127.0.0.1", "source-token", timeout=5.01)
 
 
 def test_invalid_single_job_is_completed_without_acquisition():
@@ -489,6 +783,12 @@ def test_one_shot_cli_requires_explicit_control_configuration(capsys):
     assert result == 2
     assert "--batch-limit must be 1" in capsys.readouterr().err
 
+    result = managed_worker_cli.main([
+        "--mycelium-url", "http://staging.invalid", "--worker-id", "worker", "--lease-seconds", "10",
+    ])
+    assert result == 2
+    assert "--lease-seconds must be between 60 and 600" in capsys.readouterr().err
+
 
 def test_one_shot_cli_runs_once_and_closes_client(monkeypatch, capsys):
     from app import managed_worker_cli
@@ -522,3 +822,121 @@ def test_one_shot_cli_runs_once_and_closes_client(monkeypatch, capsys):
     assert calls["worker"] == {"worker_id": "worker-1", "lease_seconds": 120, "batch_limit": 1}
     assert calls["closed"] is True
     assert '"status": "succeeded"' in capsys.readouterr().out
+
+
+def test_one_shot_cli_runs_synthetic_worker_slice_without_provider(monkeypatch, capsys):
+    from app import managed_worker_cli
+    from app.managed_worker import ManagedYouTubeWorker as RealWorker
+
+    control = FakeControl()
+
+    class ControlAdapter(FakeControl):
+        instances = []
+
+        def __init__(self, url, token):
+            self.url, self.token = url, token
+            super().__init__(jobs=control.jobs)
+            self.instances.append(self)
+
+        def close(self):
+            pass
+
+    def worker_factory(control_plane, **kwargs):
+        return RealWorker(control_plane, acquisition=FakeAcquisition(), **kwargs)
+
+    monkeypatch.setattr(managed_worker_cli, "MyceliumSourceControlClient", ControlAdapter)
+    monkeypatch.setattr(managed_worker_cli, "ManagedYouTubeWorker", worker_factory)
+    monkeypatch.setenv("MYCELIUM_YOUTUBE_SOURCE_TOKEN", "test-token")
+    result = managed_worker_cli.main([
+        "--mycelium-url", "http://127.0.0.1",
+        "--worker-id", "worker-1",
+        "--lease-seconds", "60",
+    ])
+    assert result == 0
+    assert len(ControlAdapter.instances[0].submissions) == 1
+    assert '"status": "succeeded"' in capsys.readouterr().out
+
+
+def test_cli_real_client_and_worker_use_loopback_control_plane(monkeypatch, capsys):
+    from app import managed_worker_cli
+    from app.managed_worker import ManagedYouTubeWorker as RealWorker
+
+    job = {
+        "job_id": "job-loopback",
+        "adapter": "youtube",
+        "state": "leased",
+        "lease_token": "lease-loopback",
+        "resource_ref": "@channel",
+        "max_items": 1,
+        "backfill_days": 30,
+    }
+    requests_seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            body = json.loads(self.rfile.read(length))
+            requests_seen.append((self.path, body, self.headers.get("Authorization")))
+            if self.path.endswith("/jobs/lease"):
+                response = {"jobs": [job]}
+            elif self.path.endswith("/submit"):
+                response = {"evidence_durable": True, "state": "queued"}
+            else:
+                response = {"state": "succeeded"}
+            encoded = json.dumps(response).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def worker_factory(control_plane, **kwargs):
+        return RealWorker(
+            control_plane,
+            acquisition=FakeAcquisition(),
+            utc_now=lambda: datetime(2026, 9, 27, 12, tzinfo=timezone.utc),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(managed_worker_cli, "ManagedYouTubeWorker", worker_factory)
+    monkeypatch.setenv("MYCELIUM_YOUTUBE_SOURCE_TOKEN", "loopback-token")
+    try:
+        result = managed_worker_cli.main([
+            "--mycelium-url", f"http://127.0.0.1:{server.server_port}",
+            "--worker-id", "worker-loopback",
+            "--lease-seconds", "60",
+        ])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output[0]["status"] == "succeeded"
+    assert [path for path, _, _ in requests_seen] == [
+        "/api/v1/ingest-control/youtube/jobs/lease",
+        "/api/v1/ingest-control/youtube/jobs/job-loopback/submit",
+        "/api/v1/ingest-control/youtube/jobs/job-loopback/complete",
+    ]
+    assert all(auth == "Bearer loopback-token" for _, _, auth in requests_seen)
+    assert requests_seen[0][1] == {"worker_id": "worker-loopback", "limit": 1, "lease_seconds": 60}
+    submit_body = requests_seen[1][1]
+    capture = submit_body["capture"]
+    assert capture["media_type"] == "application/vnd.mycelium.youtube-timed-caption+json"
+    raw_capture = base64.b64decode(capture["content_base64"], validate=True)
+    assert len(capture["sha256"]) == 64
+    assert hashlib.sha256(raw_capture).hexdigest() == capture["sha256"]
+    assert json.loads(raw_capture)["schema_version"] == "youtube.timed-caption.v1"
+    assert submit_body["metadata"]["timed_caption_schema"] == "youtube.timed-caption.v1"
+    assert requests_seen[2][1] == {
+        "worker_id": "worker-loopback", "lease_token": "lease-loopback",
+        "status": "succeeded", "processed_items": 1, "error_code": None,
+    }
