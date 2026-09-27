@@ -1,6 +1,7 @@
 """Tests for the channel backfill orchestrator."""
 import functools
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -49,7 +50,8 @@ def fake_clean(snips, vid):
 
 def make_backfill(
     tmp_path, *, pg=None, indexer=None, list_videos=None, fetch_meta=None,
-    fetch_transcript=None, clean=fake_clean, sleep=lambda s: None, clock=lambda: 0.0, delay=(0, 0),
+    fetch_transcript=None, clean=fake_clean, sleep=lambda s: None, clock=lambda: 0.0,
+    wall=lambda: 0.0, delay=(0, 0),
 ):
     store = BackfillStore(str(tmp_path / "b.sqlite3"))
     pg = pg or FakePg()
@@ -61,7 +63,7 @@ def make_backfill(
             lambda v: VideoMeta(v, "Title", "2026-09-15T00:00:00Z", 900, "UCx", "WarFronts", "", "")
         ),
         fetch_transcript=fetch_transcript or (lambda v: list(LONG_TRANSCRIPT)),
-        clean=clean, index=indexer, sleep=sleep, clock=clock, delay=delay,
+        clean=clean, index=indexer, sleep=sleep, clock=clock, wall=wall, delay=delay,
     )
     return b, store, pg, indexer
 
@@ -211,6 +213,184 @@ def test_discover_deduplicates_and_handles_exception(tmp_path):
 
     b._list_videos = failing_list
     assert b.run(["@bad"]).discovered == 0
+
+
+def test_discovery_limit_is_passed_per_channel_and_enforced_across_channels(tmp_path):
+    refs = {
+        "@one": [VideoRef("v1", "T1", 900), VideoRef("v2", "T2", 900)],
+        "@two": [VideoRef("v3", "T3", 900), VideoRef("v4", "T4", 900)],
+    }
+    calls = []
+
+    def bounded_list(handle, *, limit=None):
+        calls.append((handle, limit))
+        return refs[handle]
+
+    b, store, _, _ = make_backfill(tmp_path, list_videos=bounded_list)
+    summary = b.run(["@one", "@two"], limit=3)
+
+    assert calls == [("@one", 3), ("@two", 1)]
+    assert summary.discovered == 3
+    assert store.stats()["total"] == 3
+
+
+def test_discovery_limit_defends_against_legacy_enumerator_ignoring_bound(tmp_path):
+    refs = [VideoRef(f"v{i}", f"T{i}", 900) for i in range(5)]
+    calls = []
+
+    def unbounded_list(handle):
+        calls.append(handle)
+        return refs
+
+    b, store, _, _ = make_backfill(tmp_path, list_videos=unbounded_list)
+    summary = b.run(["@one", "@two"], limit=2)
+
+    assert calls == ["@one"]
+    assert summary.discovered == 2
+    assert store.stats()["total"] == 2
+
+
+def test_discovery_without_limit_preserves_legacy_enumerator_behavior(tmp_path):
+    refs = [VideoRef("v1", "T1", 900), VideoRef("v2", "T2", 900)]
+    calls = []
+
+    def legacy_list(handle):
+        calls.append(handle)
+        return refs
+
+    b, store, _, _ = make_backfill(tmp_path, list_videos=legacy_list)
+    summary = b.run(["@one"], limit=0)
+
+    assert calls == ["@one"]
+    assert summary.discovered == 2
+    assert store.stats()["total"] == 2
+
+
+def test_backfill_days_filters_before_processing_and_fails_closed_on_unknown_dates(tmp_path):
+    now = datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()
+    refs = [
+        VideoRef("recent", "Recent", 900, "2026-09-25T00:00:00Z"),
+        VideoRef("old", "Old", 900, "2026-09-01T00:00:00Z"),
+        VideoRef("unknown", "Unknown", 900),
+    ]
+    metadata_calls, transcript_calls = [], []
+
+    def fetch_meta(video_id):
+        metadata_calls.append(video_id)
+        return VideoMeta(video_id, video_id, "2026-09-25T00:00:00Z", 900, "UCx", "WarFronts", "", "")
+
+    b, store, _, _ = make_backfill(
+        tmp_path,
+        list_videos=lambda handle: refs,
+        fetch_meta=fetch_meta,
+        fetch_transcript=lambda video_id: transcript_calls.append(video_id) or list(LONG_TRANSCRIPT),
+        wall=lambda: now,
+    )
+    summary = b.run(["@one"], limit=3, backfill_days=7)
+
+    assert summary.discovered == 3
+    assert summary.out_of_window == 1
+    assert summary.unknown_dates == 1
+    assert summary.incomplete is True
+    assert summary.aborted == ""
+    assert store.stats()["total"] == 1
+    assert store.get("recent")["published_at"] == "2026-09-25T00:00:00Z"
+    assert metadata_calls == ["recent"]
+    assert transcript_calls == ["recent"]
+
+
+def test_date_window_bounds_existing_rows_without_discovery(tmp_path):
+    now = datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()
+    metadata_calls, transcript_calls = [], []
+    b, store, _, _ = make_backfill(
+        tmp_path,
+        list_videos=lambda handle: (_ for _ in ()).throw(AssertionError("discovery called")),
+        fetch_meta=lambda video_id: (
+            metadata_calls.append(video_id)
+            or VideoMeta(video_id, video_id, "2026-09-25T00:00:00Z", 900, "UCx", "WarFronts", "", "")
+        ),
+        fetch_transcript=lambda video_id: transcript_calls.append(video_id) or list(LONG_TRANSCRIPT),
+        wall=lambda: now,
+    )
+    store.register("recent", "@one", "Recent", 900, "2026-09-25T00:00:00Z")
+    store.register("old", "@one", "Old", 900, "2026-09-01T00:00:00Z")
+    store.register("unknown", "@one", "Unknown", 900)
+    store.register("refresh", "@one", "Refresh", 900)
+    assert store.register("refresh", "@one", "Refresh", 900, "2026-09-25T00:00:00Z") is False
+
+    summary = b.run([], limit=3, discover=False, backfill_days=7)
+
+    assert summary.out_of_window == 1
+    assert summary.unknown_dates == 1
+    assert summary.incomplete is True
+    assert metadata_calls == ["recent", "refresh"]
+    assert transcript_calls == ["recent", "refresh"]
+    assert store.get("old")["status"] == "pending"
+    assert store.get("unknown")["status"] == "pending"
+    assert store.get("refresh")["published_at"] == "2026-09-25T00:00:00Z"
+
+
+def test_date_window_does_not_retry_out_of_window_or_unknown_outbox_rows(tmp_path):
+    now = datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()
+    pg = FakePg()
+    b, store, _, _ = make_backfill(tmp_path, pg=pg, wall=lambda: now)
+    for video_id, published_at in (
+        ("old", "2026-09-01T00:00:00Z"),
+        ("unknown", None),
+    ):
+        store.register(video_id, "@one", video_id, 900, published_at)
+        store.mark_done(video_id, published_at, "article", "{}", "{}")
+
+    summary = b.run([], limit=1, discover=False, backfill_days=7)
+
+    assert pg.calls == []
+    assert summary.out_of_window == 1
+    assert summary.unknown_dates == 1
+    assert summary.incomplete is True
+    assert store.get("old")["persisted_at"] is None
+    assert store.get("unknown")["persisted_at"] is None
+
+
+@pytest.mark.parametrize("backfill_days", [0, 91])
+def test_backfill_days_bounds_fail_before_enumeration(tmp_path, backfill_days):
+    calls = []
+    b, _, _, _ = make_backfill(
+        tmp_path,
+        list_videos=lambda handle: calls.append(handle),
+    )
+
+    with pytest.raises(ValueError, match="1 through 90"):
+        b.run(["@one"], limit=1, backfill_days=backfill_days)
+
+    assert calls == []
+
+
+def test_date_bounded_discovery_requires_a_positive_item_limit(tmp_path):
+    calls = []
+    b, _, _, _ = make_backfill(
+        tmp_path,
+        list_videos=lambda handle: calls.append(handle),
+    )
+
+    with pytest.raises(ValueError, match="requires a limit"):
+        b.run(["@one"], backfill_days=7)
+
+    assert calls == []
+
+
+def test_item_limit_upper_bound_fails_before_enumeration_but_legacy_zero_is_unbounded(tmp_path):
+    calls = []
+    b, _, _, _ = make_backfill(
+        tmp_path,
+        list_videos=lambda handle: calls.append(handle) or [],
+    )
+
+    with pytest.raises(ValueError, match="1 through 1000"):
+        b.run(["@one"], limit=1001)
+    assert calls == []
+
+    b.run(["@one"], limit=0)
+    assert calls == ["@one"]
 
 
 def test_max_hours_limit(tmp_path):

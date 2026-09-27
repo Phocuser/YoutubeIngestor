@@ -1,13 +1,14 @@
 """Resumable channel backfill: enumerate a channel, fetch timed transcripts, and
 deliver a reversible caption capture to Mycelium.
 
-    python -m app.backfill [--limit N] [--max-hours H] [--channels @handle,...]
+    python -m app.backfill [--limit N] [--backfill-days N] [--max-hours H] [--channels @handle,...]
 
 State lives in SQLite, so an interrupted or throttled run simply resumes next time.
 """
 import argparse
 import errno
 import fcntl
+import inspect
 import json
 import logging
 import random
@@ -15,6 +16,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -28,6 +30,10 @@ from .youtube_client import TranscriptBlocked, fetch_timed_transcript
 LOGGER = logging.getLogger(__name__)
 
 BLOCK_BACKOFF_SECONDS = (300, 900, 1800, 1800, 3600)
+MIN_BACKFILL_DAYS = 1
+MAX_BACKFILL_DAYS = 90
+MIN_DISCOVERY_LIMIT = 1
+MAX_DISCOVERY_LIMIT = 1000
 
 
 class AlreadyRunning(RuntimeError):
@@ -64,6 +70,9 @@ class Summary:
     indexed: int = 0
     delivery_failures: int = 0
     ads_removed_seconds: float = 0.0
+    out_of_window: int = 0
+    unknown_dates: int = 0
+    incomplete: bool = False
     aborted: str = ""
 
 
@@ -101,18 +110,117 @@ class Backfill:
 
     # -- discovery ----------------------------------------------------------
 
-    def discover(self, channels: List[str], summary: Summary) -> None:
+    @staticmethod
+    def _validate_discovery_bounds(limit: int, backfill_days: Optional[int]) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("limit must be an integer")
+        if limit != 0 and not (MIN_DISCOVERY_LIMIT <= limit <= MAX_DISCOVERY_LIMIT):
+            raise ValueError("limit must be 0 or an integer from 1 through 1000")
+        if backfill_days is None:
+            return
+        if isinstance(backfill_days, bool) or not isinstance(backfill_days, int):
+            raise ValueError("backfill_days must be an integer from 1 through 90")
+        if not (MIN_BACKFILL_DAYS <= backfill_days <= MAX_BACKFILL_DAYS):
+            raise ValueError("backfill_days must be an integer from 1 through 90")
+        if limit == 0:
+            raise ValueError("backfill_days requires a limit from 1 through 1000")
+
+    def _list_channel_videos(self, handle: str, limit: Optional[int]):
+        """Call injected enumerators with a bound while keeping old adapters usable."""
+        if limit is None:
+            return self._list_videos(handle)
+
+        try:
+            parameters = inspect.signature(self._list_videos).parameters.values()
+            supports_limit = any(
+                parameter.name == "limit" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_limit = True
+
+        if supports_limit:
+            return self._list_videos(handle, limit=limit)
+        return self._list_videos(handle)
+
+    def _publication_date(self, value: Any) -> Optional[datetime]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _mark_incomplete(self, summary: Summary) -> None:
+        summary.incomplete = True
+
+    def _window_bounds(self, backfill_days: Optional[int]):
+        if backfill_days is None:
+            return None
+        now = datetime.fromtimestamp(self._wall(), timezone.utc)
+        return now - timedelta(days=backfill_days), now
+
+    def _row_in_window(self, row: Dict[str, Any], summary: Summary, window) -> bool:
+        if window is None:
+            return True
+        cutoff, now = window
+        published_at = self._publication_date(row.get("published_at"))
+        if published_at is None:
+            summary.unknown_dates += 1
+            self._mark_incomplete(summary)
+            return False
+        if published_at < cutoff or published_at > now:
+            summary.out_of_window += 1
+            return False
+        return True
+
+    def discover(
+        self,
+        channels: List[str],
+        summary: Summary,
+        *,
+        limit: int = 0,
+        backfill_days: Optional[int] = None,
+        window=None,
+    ) -> None:
+        self._validate_discovery_bounds(limit, backfill_days)
+        remaining = limit if limit > 0 else None
+        window = self._window_bounds(backfill_days) if window is None else window
+
         for handle in channels:
+            if remaining is not None and remaining <= 0:
+                break
             try:
-                refs = self._list_videos(handle)
+                refs = self._list_channel_videos(handle, remaining)
             except Exception as exc:  # noqa: BLE001 - keep going with what we already know
                 LOGGER.warning("could not enumerate %s: %s", handle, exc)
                 continue
-            new = sum(
-                1 for r in refs if self.store.register(r.video_id, handle, r.title, r.duration)
-            )
-            summary.discovered += len(refs)
-            LOGGER.info("%s: %d videos listed, %d new", handle, len(refs), new)
+
+            listed = 0
+            new = 0
+            for ref in refs:
+                if remaining is not None and listed >= remaining:
+                    break
+                listed += 1
+                summary.discovered += 1
+
+                published_at = getattr(ref, "published_at", None)
+                if window is not None and not self._row_in_window(
+                    {"published_at": published_at}, summary, window
+                ):
+                    continue
+
+                if self.store.register(
+                    ref.video_id, handle, ref.title, ref.duration, published_at
+                ):
+                    new += 1
+
+            if remaining is not None:
+                remaining -= listed
+            LOGGER.info("%s: %d videos listed, %d new", handle, listed, new)
 
     # -- delivery -----------------------------------------------------------
 
@@ -140,9 +248,23 @@ class Backfill:
             summary.delivery_failures += 1
             return
 
-    def retry_sweep(self, summary: Summary) -> None:
+    def retry_sweep(self, summary: Summary, *, window=None) -> None:
         for row in self.store.undelivered_postgres():
+            if not self._row_in_window(row, summary, window):
+                continue
             self._deliver_pg(row, summary)
+
+    def _todo_rows(self, limit: int, summary: Summary, window):
+        if window is None:
+            return self.store.todo(limit=limit)
+        rows = []
+        for row in self.store.todo(limit=0):
+            if not self._row_in_window(row, summary, window):
+                continue
+            rows.append(row)
+            if limit > 0 and len(rows) >= limit:
+                break
+        return rows
 
     # -- one video ----------------------------------------------------------
 
@@ -230,14 +352,24 @@ class Backfill:
         limit: int = 0,
         max_hours: float = 0.0,
         discover: bool = True,
+        backfill_days: Optional[int] = None,
     ) -> Summary:
+        self._validate_discovery_bounds(limit, backfill_days)
+
         summary = Summary()
         started = self._clock()
         self._wait_out_cooldown()
+        window = self._window_bounds(backfill_days)
         if discover:
-            self.discover(channels, summary)
-        self.retry_sweep(summary)
-        for row in self.store.todo(limit=limit):
+            self.discover(
+                channels,
+                summary,
+                limit=limit,
+                backfill_days=backfill_days,
+                window=window,
+            )
+        self.retry_sweep(summary, window=window)
+        for row in self._todo_rows(limit, summary, window):
             if max_hours and self._clock() - started > max_hours * 3600:
                 summary.aborted = f"stopped after {max_hours}h (resume by re-running)"
                 break
@@ -254,6 +386,7 @@ class Backfill:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="app.backfill", description=__doc__.splitlines()[0])
     parser.add_argument("--limit", type=int, default=0, help="process at most N videos")
+    parser.add_argument("--backfill-days", type=int, default=None, help="only discover videos published in the last N days")
     parser.add_argument("--max-hours", type=float, default=0.0, help="stop after H hours")
     parser.add_argument("--channels", default="", help="comma-separated @handles/UC ids (default: BACKFILL_CHANNELS)")
     parser.add_argument("--no-discover", action="store_true", help="skip re-listing the channel(s)")
@@ -274,13 +407,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             pg = None if args.no_postgres else MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
             channels = [c.strip() for c in args.channels.split(",") if c.strip()] or settings.backfill_channels
             summary = Backfill(settings, store, pg, delay=(args.delay_min, args.delay_max)).run(
-                channels, limit=args.limit, max_hours=args.max_hours, discover=not args.no_discover
+                channels,
+                limit=args.limit,
+                max_hours=args.max_hours,
+                discover=not args.no_discover,
+                backfill_days=args.backfill_days,
             )
     except AlreadyRunning:
         print("backfill already running; exiting", file=sys.stderr)
         return 3
     print(json.dumps(asdict(summary), indent=2))
-    return 1 if (summary.aborted or summary.delivery_failures or summary.errors) else 0
+    return 1 if (summary.aborted or summary.incomplete or summary.delivery_failures or summary.errors) else 0
 
 
 if __name__ == "__main__":

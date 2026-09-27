@@ -39,6 +39,20 @@ class FakeYDLContext:
         return self.return_data
 
 
+class OrderingYDLContext(FakeYDLContext):
+    def __init__(self, return_data=None):
+        super().__init__(return_data=return_data)
+        self.events = []
+
+    def __call__(self, opts):
+        self.events.append(("factory", opts.copy()))
+        return super().__call__(opts)
+
+    def extract_info(self, url, download=False):
+        self.events.append(("extract_info", url, download))
+        return super().extract_info(url, download=download)
+
+
 def test_channel_url_variants():
     # Handle with leading @
     assert (
@@ -185,6 +199,113 @@ def test_list_channel_videos_skips_entries_without_id():
 
     assert len(results) == 1
     assert results[0].video_id == "valid_id"
+
+
+def test_list_channel_videos_limit_is_passed_before_extraction():
+    entries = [{"id": "vid_1", "title": "First", "duration": 300}]
+    fake_factory = OrderingYDLContext(return_data={"entries": entries})
+
+    results = list_channel_videos(
+        "warographics643", limit=3, ydl_factory=fake_factory
+    )
+
+    assert [result.video_id for result in results] == ["vid_1"]
+    assert fake_factory.recorded_opts["playlistend"] == 3
+    assert fake_factory.recorded_opts["playlistend"] is not None
+    assert fake_factory.recorded_calls == [
+        ("https://www.youtube.com/@warographics643/videos", False)
+    ]
+    assert [event[0] for event in fake_factory.events] == ["factory", "extract_info"]
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1, True, 1.5, "3"])
+def test_list_channel_videos_rejects_invalid_limits(invalid_limit):
+    fake_factory = FakeYDLContext(return_data={"entries": []})
+
+    with pytest.raises(ValueError, match="positive integer"):
+        list_channel_videos(
+            "warographics643", limit=invalid_limit, ydl_factory=fake_factory
+        )
+
+    assert fake_factory.recorded_opts is None
+
+
+def test_list_channel_videos_limit_is_enforced_after_flattening_filtering_and_deduplication():
+    entries = [
+        {"id": "vid_1", "title": "First", "duration": 300},
+        {
+            "title": "Nested",
+            "entries": [
+                {"id": "vid_2", "title": "Second", "duration": 400},
+                {"id": "vid_1", "title": "Duplicate", "duration": 300},
+                {"id": "vid_3", "title": "Third", "duration": 500},
+            ],
+        },
+    ]
+    fake_factory = FakeYDLContext(return_data={"entries": entries})
+
+    results = list_channel_videos(
+        "warographics643", min_duration=120, limit=2, ydl_factory=fake_factory
+    )
+
+    assert [result.video_id for result in results] == ["vid_1", "vid_2"]
+    assert len(results) <= 2
+
+
+def test_list_channel_videos_limit_does_not_materialize_ignored_listing_tail():
+    def entries():
+        for index in range(3):
+            yield {"id": f"vid_{index}", "title": f"Video {index}", "duration": 300}
+        raise AssertionError("listing was consumed past the local bound")
+
+    fake_factory = FakeYDLContext(return_data={"entries": entries()})
+
+    results = list_channel_videos("warographics643", limit=3, ydl_factory=fake_factory)
+
+    assert [result.video_id for result in results] == ["vid_0", "vid_1", "vid_2"]
+
+
+@pytest.mark.parametrize("raw_date", [None, "", "not-a-date", "20240230"])
+def test_list_channel_videos_represents_missing_or_malformed_dates_as_unknown(raw_date):
+    fake_factory = FakeYDLContext(
+        return_data={"entries": [{"id": "vid_1", "title": "Video", "duration": 300, "upload_date": raw_date}]}
+    )
+
+    results = list_channel_videos("warographics643", ydl_factory=fake_factory)
+
+    assert results[0].published_at is None
+
+
+def test_list_channel_videos_preserves_structured_publication_date():
+    fake_factory = FakeYDLContext(
+        return_data={
+            "entries": [
+                {
+                    "id": "vid_1",
+                    "title": "Video",
+                    "duration": 300,
+                    "upload_date": "20240229",
+                }
+            ]
+        }
+    )
+
+    results = list_channel_videos("warographics643", ydl_factory=fake_factory)
+
+    assert results[0].published_at == "2024-02-29T00:00:00Z"
+
+
+def test_list_channel_videos_without_limit_keeps_existing_provider_options_and_behavior():
+    entries = [
+        {"id": "vid_1", "title": "First", "duration": 300},
+        {"id": "vid_2", "title": "Second", "duration": 400},
+    ]
+    fake_factory = FakeYDLContext(return_data={"entries": entries})
+
+    results = list_channel_videos("warographics643", ydl_factory=fake_factory)
+
+    assert [result.video_id for result in results] == ["vid_1", "vid_2"]
+    assert "playlistend" not in fake_factory.recorded_opts
 
 
 def test_fetch_video_meta():
