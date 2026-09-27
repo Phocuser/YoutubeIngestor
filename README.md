@@ -139,3 +139,24 @@ not proof that downstream indexing has completed.
 Ad removal: SponsorBlock's community segments (`sponsor`, `selfpromo`, `interaction`) are used when they exist; otherwise a conservative keyword heuristic anchored on the spoken transitions ("before we go any further" ... "let's get back to"). What was removed is recorded per article in `metadata` (`ads_removed_seconds`, `ad_removal_sources`).
 
 State is in `data/backfill.sqlite3`; YouTube throttling triggers long backoffs and a resumed round, never lost work. Videos with no captions are recorded as `no_transcript`.
+
+### Managed source one-shot worker
+
+The released managed YouTube control plane can be exercised with one bounded
+worker pass. Set the source token in the protected
+`MYCELIUM_YOUTUBE_SOURCE_TOKEN` environment variable. The command requires
+the Mycelium URL and does not read credentials from source files or process
+arguments:
+
+```bash
+export MYCELIUM_YOUTUBE_SOURCE_TOKEN
+python -m app.managed_worker_cli \
+  --mycelium-url "https://mycelium-staging.example.invalid" \
+  --worker-id "youtube-worker-1" \
+  --batch-limit 1
+```
+
+The one-shot runner leases one job per pass, processes only the
+leased source's bounded date window, submits typed timed captions, and prints
+completion outcomes before exiting. A successful outcome confirms durable
+capture admission; it does not confirm downstream indexing or materialization.

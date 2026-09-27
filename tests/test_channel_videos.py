@@ -252,6 +252,22 @@ def test_list_channel_videos_limit_is_enforced_after_flattening_filtering_and_de
     assert len(results) <= 2
 
 
+def test_short_candidates_at_raw_bound_are_marked_truncated():
+    entries = [
+        {"id": "short-1", "title": "Short", "duration": 45},
+        {"id": "long-1", "title": "Long one", "duration": 300},
+        {"id": "long-2", "title": "Long two", "duration": 400},
+    ]
+    fake_factory = FakeYDLContext(return_data={"entries": entries})
+
+    results = list_channel_videos(
+        "warographics643", min_duration=120, limit=3, ydl_factory=fake_factory
+    )
+
+    assert [result.video_id for result in results] == ["long-1", "long-2"]
+    assert results.truncated is True
+
+
 def test_list_channel_videos_limit_does_not_materialize_ignored_listing_tail():
     def entries():
         for index in range(3):

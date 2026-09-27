@@ -33,6 +33,14 @@ class VideoMeta:
     live_status: str
 
 
+class VideoDiscovery(list):
+    """Bounded discovery results with an explicit raw scan truncation flag."""
+
+    def __init__(self, values=(), *, truncated: bool = False):
+        super().__init__(values)
+        self.truncated = truncated
+
+
 def channel_url(handle_or_url: str) -> str:
     """Normalize a channel handle, channel ID, or URL into a channel videos URL."""
     val = handle_or_url.strip()
@@ -87,7 +95,7 @@ def list_channel_videos(
 
     raw_entries = info.get("entries") if isinstance(info, dict) else None
     if not raw_entries:
-        return []
+        return VideoDiscovery()
 
     def iter_flat_entries():
         """Yield flat entries without retaining the provider listing."""
@@ -105,8 +113,10 @@ def list_channel_videos(
     seen_ids = set()
     results: List[VideoRef] = []
     raw_candidates = 0
+    raw_bound_reached = False
     for entry in iter_flat_entries():
         if limit is not None and raw_candidates >= limit:
+            raw_bound_reached = True
             break
         raw_candidates += 1
         vid_id = entry.get("id")
@@ -141,7 +151,13 @@ def list_channel_videos(
         if limit is not None and len(results) >= limit:
             break
 
-    return results
+    # A raw bound reached before the qualifying result bound means the caller
+    # cannot truthfully infer that no additional eligible videos exist. Keep
+    # the result bounded and expose the uncertainty to the managed worker.
+    truncated = bool(limit is not None and raw_bound_reached)
+    if limit is not None and raw_candidates >= limit and len(results) < limit:
+        truncated = True
+    return VideoDiscovery(results, truncated=truncated)
 
 
 def fetch_video_meta(
