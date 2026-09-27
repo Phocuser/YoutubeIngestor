@@ -22,6 +22,8 @@ def test_health_endpoint(client):
     assert "status" in data
     assert "channels_configured" in data
     assert "total_processed_videos" in data
+    assert data["durable_ingestion_enabled"] is False
+    assert data["polling_enabled"] is False
 
 
 def test_poll_now_endpoint(client):

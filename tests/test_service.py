@@ -25,8 +25,22 @@ class ReceiptSubmitter:
         return SimpleNamespace(state=self.state)
 
 
+class LinkedReceiptSubmitter(ReceiptSubmitter):
+    def submit(self, article, metadata):
+        self.calls.append((article, metadata))
+        number = len(self.calls)
+        return SimpleNamespace(
+            state=self.state,
+            receipt_id=f"receipt-{number}",
+            job_id=f"job-{number}",
+            submission_id=f"submission-{number}",
+        )
+
+
 class TestYoutubeClient:
     """Small synchronous double safe to pass through asyncio.to_thread."""
+    __test__ = False
+
     def __init__(self):
         self.fetch_channel_feed_calls = []
         self.fetch_channel_feed_return_value = None
@@ -91,6 +105,7 @@ async def test_poll_uses_timed_captions_and_durable_receipt(service_and_store):
     assert client.fetch_timed_transcript_calls == [("vid-1",)]
     assert client.fetch_transcript_calls == []
     assert len(submitter.calls) == 1
+    assert submitter.calls[0][1]["access_scope"] == "public"
     row = store.get_video("vid-1")
     assert row["persisted_at"] is not None
     article = json.loads(row["pending_article_json"])
@@ -108,8 +123,59 @@ async def test_dedupes_after_durable_persistence(service_and_store):
     client.fetch_timed_transcript_return_value = list(TIMED_CAPTIONS)
     assert len(await service.poll_once()) == 1
     assert len(await service.poll_once()) == 0
-    assert len(client.fetch_timed_transcript_calls) == 1 and len(submitter.calls) == 1
+    # Existing videos are fetched again so timing/track-only revisions cannot
+    # be hidden by local prose dedupe; the typed digest keeps the replay local.
+    assert len(client.fetch_timed_transcript_calls) == 2 and len(submitter.calls) == 1
     assert store.get_video("vid-1")["persisted_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_timing_revision_quarantine_is_idempotent_and_newer_revision_reopens(service_and_store):
+    service, store, client, _ = service_and_store
+    submitter = LinkedReceiptSubmitter()
+    service.submitter = submitter
+    client.fetch_channel_feed_return_value = [_video("revision-video")]
+
+    first = list(TIMED_CAPTIONS)
+    changed = [("Opening analysis", 0.0, 2.0), ("The raw caption track is retained.", 4.0, 3.0)]
+    newer = [("Opening analysis", 0.0, 2.0), ("The raw caption track is retained.", 5.0, 3.0)]
+
+    submitter.state = "queued"
+    client.fetch_timed_transcript_return_value = first
+    assert len(await service.poll_once()) == 1
+    assert len(submitter.calls) == 1
+    initial = store.get_video("revision-video")
+    assert initial["admission_state"] == "queued"
+    assert initial["admission_receipt_id"] == "receipt-1"
+    assert initial["admission_job_id"] == "job-1"
+    assert initial["admission_submission_id"] == "submission-1"
+    assert initial["materialization_state"] == "unknown"
+    assert initial["indexed_at"] is None
+
+    submitter.state = "quarantined"
+    client.fetch_timed_transcript_return_value = changed
+    assert len(await service.poll_once()) == 1
+    assert len(submitter.calls) == 2
+    quarantined = store.get_video("revision-video")
+    assert quarantined["review_state"] == "revision_needed"
+    assert quarantined["admission_state"] == "quarantined"
+    assert quarantined["admission_receipt_id"] == "receipt-2"
+    assert quarantined["materialization_state"] == "unknown"
+    assert quarantined["indexed_at"] is None
+
+    # The same quarantined bytes remain durable evidence and must not be
+    # submitted repeatedly while awaiting explicit revision handling.
+    assert await service.poll_once() == []
+    assert len(submitter.calls) == 2
+
+    client.fetch_timed_transcript_return_value = newer
+    assert len(await service.poll_once()) == 1
+    assert len(submitter.calls) == 3
+    reopened = store.get_video("revision-video")
+    assert reopened["admission_state"] == "quarantined"
+    assert reopened["admission_receipt_id"] == "receipt-3"
+    assert reopened["materialization_state"] == "unknown"
+    assert reopened["indexed_at"] is None
 
 
 @pytest.mark.asyncio

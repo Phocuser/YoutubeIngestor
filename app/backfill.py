@@ -206,6 +206,7 @@ class Backfill:
                 channel_name=meta.channel_name or "YouTube",
                 published_at=meta.published_at, cleaner=self._clean,
                 duration=meta.duration,
+                is_public_channel_feed=True,
             )
             self.store.mark_done(
                 video_id, meta.published_at, envelope["id"], json.dumps(envelope), json.dumps(metadata)

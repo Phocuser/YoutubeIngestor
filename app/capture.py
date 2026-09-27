@@ -65,6 +65,7 @@ def build_capture(
     caption_kind: str = "unknown",
     cleaner: Callable | None = None,
     duration: int | None = None,
+    is_public_channel_feed: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     track = timed_track(video_id, transcript, track_id=track_id, language=language,
                         caption_kind=caption_kind,
@@ -103,4 +104,8 @@ def build_capture(
         "ad_removal_sources": list(view.sources), "ad_ranges": [list(r) for r in view.ranges],
         "ad_decisions": view.decisions or [], "ad_policy_version": view.policy_version,
     }
+    # A channel ID alone is not an authorization signal. Only ingestion paths
+    # that enumerated this item from a public channel feed may set a public ACL.
+    if is_public_channel_feed:
+        metadata["access_scope"] = "public"
     return envelope, metadata

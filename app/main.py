@@ -59,6 +59,8 @@ def health() -> Dict[str, Any]:
         "ok": info["status"] == "healthy",
         "status": info["status"],
         "channels_configured": info["channels_configured"],
+        "durable_ingestion_enabled": info["durable_ingestion_enabled"],
+        "polling_enabled": info["polling_enabled"],
         "last_poll_at": info["last_poll_at"],
         "last_error": info["last_error"],
         "total_processed_videos": info["total_processed_videos"],

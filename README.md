@@ -60,7 +60,7 @@ This service:
 
 ## API Endpoints
 
-- `GET /health`: Returns service health status, last poll timestamp, last error (if any), count of configured channels, and total processed videos count.
+- `GET /health`: Returns process health, durable-ingestion and polling enablement, last poll timestamp, last error (if any), configured channel count, and total processed video count. A healthy process may still have ingestion disabled; check both enablement fields before accepting data.
 - `POST /poll-now`: Triggers an immediate poll cycle across all configured channels outside the regular schedule.
 
 ---
