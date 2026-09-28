@@ -15,6 +15,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out the pinned Mycelium source tree
+        uses: actions/checkout@v4
+        with:
+          repository: Phocuser/mycelium
+          ref: 0a0ed4c06bd9c33fd1cde4c815d0c5a439dd1ea8
+          path: mycelium-source
+      - name: Prepare clean pinned Mycelium build context
+        run: |
+          mkdir mycelium-context
+          git -C mycelium-source archive 0a0ed4c06bd9c33fd1cde4c815d0c5a439dd1ea8 | tar -x -C mycelium-context
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -35,6 +45,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-contexts: mycelium-source=./mycelium-context
           push: ${{ github.event_name == 'push' }}
           tags: ghcr.io/phocuser/youtubeingestor:${{ github.sha }}
           build-args: VCS_REF=${{ github.sha }}

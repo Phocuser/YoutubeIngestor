@@ -92,7 +92,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8083
 
 Build and run the container:
 ```bash
-docker build -t mycelium-youtube-captions .
+docker buildx build --build-context mycelium-source=/path/to/clean/mycelium-source \
+  --tag mycelium-youtube-captions --load .
 docker run -d \
   -p 8083:8083 \
   -e YOUTUBE_CHANNEL_IDS="UC_x5XG1OV2P6uZZ5FSM9Ttw" \

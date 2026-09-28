@@ -1,6 +1,3 @@
-ARG MYCELIUM_IMAGE
-FROM ${MYCELIUM_IMAGE} AS mycelium-source
-
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -19,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
-COPY --from=mycelium-source /app/ /mycelium/
+COPY --from=mycelium-source / /mycelium/
 ENV MYCELIUM_DIR=/mycelium
 
 EXPOSE 8083
