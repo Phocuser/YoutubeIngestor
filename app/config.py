@@ -15,7 +15,7 @@ class Settings:
     youtube_channel_ids: list[str] = field(
         default_factory=lambda: _parse_channel_ids(os.getenv("YOUTUBE_CHANNEL_IDS", ""))
     )
-    poll_interval_seconds: int = int(os.getenv("POLL_INTERVAL_SECONDS", "900"))
+    poll_interval_seconds: int = int(os.getenv("POLL_INTERVAL_SECONDS", "1800"))
     database_path: str = os.getenv("DATABASE_PATH", "data/youtube_captions.sqlite3")
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8083"))

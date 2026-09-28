@@ -6,7 +6,7 @@ from app.config import Settings
 def test_settings_defaults():
     with patch.dict(os.environ, {}, clear=True):
         settings = Settings()
-        assert settings.poll_interval_seconds == 900
+        assert settings.poll_interval_seconds == 1800
         assert settings.database_path == "data/youtube_captions.sqlite3"
         assert settings.mycelium_pg_url == ""
         assert settings.mycelium_dir == "../mycelium"

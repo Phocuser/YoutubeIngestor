@@ -62,6 +62,7 @@ def health() -> Dict[str, Any]:
         "durable_ingestion_enabled": info["durable_ingestion_enabled"],
         "polling_enabled": info["polling_enabled"],
         "last_poll_at": info["last_poll_at"],
+        "last_source_check_at": info["last_source_check_at"],
         "last_error": info["last_error"],
         "total_processed_videos": info["total_processed_videos"],
     }

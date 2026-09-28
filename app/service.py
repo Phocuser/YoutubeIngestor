@@ -25,6 +25,7 @@ class CaptionsService:
         self.client = client or YouTubeClient()
         self.submitter = submitter
         self.last_poll_at: Optional[str] = None
+        self.last_source_check_at: Optional[str] = self.store.get_state("last_source_check_at")
         self.last_error: Optional[str] = None
         self.is_polling: bool = False
 
@@ -35,6 +36,7 @@ class CaptionsService:
             "durable_ingestion_enabled": self.submitter is not None,
             "polling_enabled": self.submitter is not None and bool(self.settings.youtube_channel_ids),
             "last_poll_at": self.last_poll_at,
+            "last_source_check_at": self.last_source_check_at,
             "last_error": self.last_error,
             "total_processed_videos": self.store.count(),
         }
@@ -229,6 +231,9 @@ class CaptionsService:
             if self.last_error:
                 self.store.set_state("last_poll_status", f"error: {self.last_error}")
             else:
+                if self.settings.youtube_channel_ids:
+                    self.last_source_check_at = datetime.now(timezone.utc).isoformat()
+                    self.store.set_state("last_source_check_at", self.last_source_check_at)
                 self.store.set_state("last_poll_status", "ok")
 
         finally:
