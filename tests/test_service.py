@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import tempfile
@@ -10,6 +11,7 @@ import pytest
 from app.config import Settings
 from app.service import CaptionsService
 from app.store import CaptionsStore
+from app.youtube_client import TranscriptBlocked
 
 
 TIMED_CAPTIONS = [("Opening analysis", 0.0, 2.0), ("The raw caption track is retained.", 2.0, 3.0)]
@@ -269,3 +271,81 @@ async def test_retry_sweep_failure_does_not_block_new_timed_caption_poll(service
         processed = await service.poll_once()
     assert [x["video_id"] for x in processed] == ["new-video"]
     assert store.get_video("new-video")["persisted_at"] is not None and submitter.calls
+
+
+@pytest.mark.asyncio
+async def test_transcript_block_stops_the_current_batch_and_pauses_all_channels(service_and_store):
+    service, store, client, submitter = service_and_store
+    client.fetch_channel_feed_side_effect = lambda channel: [
+        _video("blocked-1"), _video("blocked-2"), _video("blocked-3")
+    ]
+    client.fetch_timed_transcript_side_effect = TranscriptBlocked("IpBlocked")
+
+    assert await service.poll_once() == []
+    assert client.fetch_channel_feed_calls == [("channel_a",)]
+    assert client.fetch_timed_transcript_calls == [("blocked-1",)]
+    assert store.get_video("blocked-1")["review_reason"] == "caption_fetch_blocked"
+    assert store.get_video("blocked-2")["review_reason"] == "caption_fetch_blocked"
+    assert "paused:" in store.get_state("last_poll_status")
+    assert submitter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_cooldown_survives_new_service_and_makes_no_provider_requests(tmp_path):
+    db = str(tmp_path / "captions.sqlite3")
+    now = datetime(2026, 9, 29, 10, 0, tzinfo=timezone.utc)
+    settings = Settings(youtube_channel_ids=["channel_a"], database_path=db)
+    store = CaptionsStore(db)
+    first_client = TestYoutubeClient()
+    first_client.fetch_channel_feed_return_value = [_video("blocked-restart")]
+    first_client.fetch_timed_transcript_side_effect = TranscriptBlocked("IpBlocked")
+    first = CaptionsService(settings, store, first_client, ReceiptSubmitter(), clock=lambda: now)
+    await first.poll_once()
+
+    restarted_store = CaptionsStore(db)
+    restarted_client = TestYoutubeClient()
+    restarted = CaptionsService(
+        settings,
+        restarted_store,
+        restarted_client,
+        ReceiptSubmitter(),
+        clock=lambda: now + timedelta(minutes=1),
+    )
+    assert await restarted.poll_once() == []
+    assert restarted_client.fetch_channel_feed_calls == []
+    assert restarted_client.fetch_timed_transcript_calls == []
+    assert restarted.check_health()["status"] == "paused"
+    assert "blocked" in restarted.check_health()["last_poll_status"]
+
+
+@pytest.mark.asyncio
+async def test_expired_transcript_cooldown_resumes_provider_requests(service_and_store):
+    service, store, client, submitter = service_and_store
+    clock = [datetime(2026, 9, 29, 10, 0, tzinfo=timezone.utc)]
+    service._clock = lambda: clock[0]
+    client.fetch_channel_feed_return_value = [_video("blocked-expiry")]
+    client.fetch_timed_transcript_side_effect = TranscriptBlocked("IpBlocked")
+    await service.poll_once()
+
+    expiry = datetime.fromisoformat(store.get_state("youtube_transcript_cooldown_until"))
+    clock[0] = expiry + timedelta(seconds=1)
+    client.fetch_channel_feed_side_effect = lambda channel: [_video("resumed")] if channel == "channel_a" else []
+    client.fetch_timed_transcript_side_effect = None
+    client.fetch_timed_transcript_return_value = list(TIMED_CAPTIONS)
+    assert [item["video_id"] for item in await service.poll_once()] == ["resumed"]
+    assert len(client.fetch_channel_feed_calls) == 3
+    assert client.fetch_timed_transcript_calls == [("blocked-expiry",), ("resumed",)]
+    assert store.get_state("youtube_transcript_cooldown_until") == ""
+    assert store.get_state("last_poll_status") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_generic_transient_caption_error_remains_retryable_without_cooldown(service_and_store):
+    service, store, client, submitter = service_and_store
+    client.fetch_channel_feed_return_value = [_video("generic-retry")]
+    client.fetch_timed_transcript_side_effect = ConnectionError("caption API unavailable")
+
+    assert await service.poll_once() == []
+    assert store.get_video("generic-retry")["review_state"] == "retryable"
+    assert store.get_state("youtube_transcript_cooldown_until") is None
+    assert store.get_state("last_poll_status") == "ok"

@@ -254,11 +254,21 @@ class CaptionsStore:
         return rows
 
     def set_state(self, key: str, value: str) -> None:
+        self.set_states({key: value})
+
+    def set_states(self, values: Dict[str, str]) -> None:
+        """Persist related service state values in one transaction.
+
+        A failed write rolls back every value in the batch, which callers use
+        for state that must never expose a partially updated cooldown.
+        """
+        if not values:
+            return
         now = datetime.now(timezone.utc).isoformat()
         with self.connection:
-            self.connection.execute(
+            self.connection.executemany(
                 "INSERT OR REPLACE INTO service_state (key, value, updated_at) VALUES (?, ?, ?)",
-                (key, value, now),
+                ((key, value, now) for key, value in values.items()),
             )
 
     def get_state(self, key: str) -> Optional[str]:
