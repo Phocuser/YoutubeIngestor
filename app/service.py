@@ -49,7 +49,7 @@ class CaptionsService:
                 else article_id
             )
         stored = self.store.get_video(target_id) if target_id else None
-        if not stored or not stored.get("pending_article_json") or stored.get("review_state") != "ready":
+        if not stored or not stored.get("pending_article_json") or stored.get("review_state") not in {"ready", "revision_needed"}:
             LOGGER.warning("refusing durable receipt submission before caption persistence for %s", target_id)
             return False
         try:
@@ -62,10 +62,10 @@ class CaptionsService:
                 stored_metadata = json.loads(stored.get("pending_metadata_json") or "{}")
                 receipt = await asyncio.to_thread(self.submitter.submit, article, stored_metadata or {"video_id": target_id, "transcript_source": "youtube-captions"})
                 state = getattr(getattr(receipt, "state", None), "value", getattr(receipt, "state", None))
-                if state not in {"queued", "leased", "retry_wait", "succeeded"}:
+                if state not in {"queued", "leased", "retry_wait", "succeeded", "quarantined"}:
                     return False
                 if target_id:
-                    self.store.mark_persisted(target_id)
+                    self.store.record_admission(target_id, receipt, state=state)
                 return True
             LOGGER.warning("no common durable receipt boundary configured for video %s", target_id)
             return False
@@ -116,6 +116,7 @@ class CaptionsService:
         self.store.set_state("last_poll_at", now)
         self.last_error = None
         processed_items: List[Dict[str, Any]] = []
+        seen_video_ids: set[str] = set()
 
         try:
             try:
@@ -132,9 +133,9 @@ class CaptionsService:
                         video_id = video.get("video_id")
                         if not video_id:
                             continue
-                        if self.store.is_processed(video_id):
+                        if video_id in seen_video_ids:
                             continue
-
+                        seen_video_ids.add(video_id)
                         title = video.get("title", "")
                         published_at = video.get("published_at") or now
                         channel_name = video.get("channel_name") or channel_id
@@ -168,6 +169,7 @@ class CaptionsService:
                             article, metadata = build_capture(
                                 video_id, transcript, title=title, channel_id=actual_channel_id,
                                 channel_name=channel_name, published_at=published_at,
+                                is_public_channel_feed=True,
                             )
                             if not any(segment["text"] for segment in article["caption_track"]["segments"]):
                                 LOGGER.warning("empty captions remain retryable for %s", video_id)
@@ -190,7 +192,12 @@ class CaptionsService:
                             pending_article_json=pending_article_json,
                             pending_metadata_json=json.dumps(metadata) if metadata else None,
                         )
-                        if recorded:
+                        revision_pending = self.store.get_video(video_id)
+                        if recorded or (
+                            revision_pending
+                            and revision_pending.get("review_state") == "revision_needed"
+                            and revision_pending.get("admission_state") == "pending"
+                        ):
                             processed_items.append(
                                 {
                                     "video_id": video_id,

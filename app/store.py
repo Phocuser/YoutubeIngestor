@@ -27,6 +27,11 @@ class CaptionsStore:
                     pending_metadata_json TEXT DEFAULT NULL,
                     persisted_at TEXT DEFAULT NULL,
                     indexed_at TEXT DEFAULT NULL,
+                    admission_state TEXT NOT NULL DEFAULT 'pending',
+                    admission_receipt_id TEXT DEFAULT NULL,
+                    admission_job_id TEXT DEFAULT NULL,
+                    admission_submission_id TEXT DEFAULT NULL,
+                    materialization_state TEXT NOT NULL DEFAULT 'unknown',
                     review_state TEXT NOT NULL DEFAULT 'ready',
                     review_reason TEXT
                 )
@@ -61,14 +66,20 @@ class CaptionsStore:
                 self.connection.execute("ALTER TABLE processed_videos ADD COLUMN review_reason TEXT")
             if "pending_metadata_json" not in cols:
                 self.connection.execute("ALTER TABLE processed_videos ADD COLUMN pending_metadata_json TEXT DEFAULT NULL")
+            for name, definition in (
+                ("admission_state", "TEXT NOT NULL DEFAULT 'pending'"),
+                ("admission_receipt_id", "TEXT DEFAULT NULL"),
+                ("admission_job_id", "TEXT DEFAULT NULL"),
+                ("admission_submission_id", "TEXT DEFAULT NULL"),
+                ("materialization_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ):
+                if name not in cols:
+                    self.connection.execute(f"ALTER TABLE processed_videos ADD COLUMN {name} {definition}")
 
     def is_processed(self, video_id: str) -> bool:
-        cursor = self.connection.execute(
-            """SELECT 1 FROM processed_videos
-               WHERE video_id = ? AND review_state = 'ready'
-                 AND (has_transcript = 1 OR review_reason IS NULL)""",
-            (video_id,),
-        )
+        cursor = self.connection.execute("""SELECT 1 FROM processed_videos
+            WHERE video_id = ? AND review_state = 'ready'
+              AND (has_transcript = 1 OR review_reason IS NULL)""", (video_id,))
         return cursor.fetchone() is not None
 
     def record_video(
@@ -90,21 +101,37 @@ class CaptionsStore:
                     self.connection.execute(
                         """UPDATE processed_videos SET channel_id=?, title=?, published_at=?,
                            processed_at=?, has_transcript=?, pending_article_json=?,
-                           pending_metadata_json=?, persisted_at=NULL, review_state='ready',
-                           review_reason=NULL WHERE video_id=?""",
+                           pending_metadata_json=?, persisted_at=NULL, admission_state='pending',
+                           admission_receipt_id=NULL, admission_job_id=NULL, admission_submission_id=NULL,
+                           materialization_state='unknown', review_state='ready', review_reason=NULL WHERE video_id=?""",
                         (channel_id, title, published_at or now, now,
                          1 if has_transcript else 0, pending_article_json,
                          pending_metadata_json, video_id),
                     )
                 return True
-            old = json.loads(existing.get("pending_article_json") or "{}").get("raw_content", "")
-            new = json.loads(pending_article_json or "{}").get("raw_content", "")
-            if old == new:
+            old_metadata = json.loads(existing.get("pending_metadata_json") or "{}")
+            new_metadata = json.loads(pending_metadata_json or "{}")
+            old_digest = old_metadata.get("raw_timed_sha256")
+            new_digest = new_metadata.get("raw_timed_sha256")
+            if old_digest and new_digest and old_digest == new_digest:
                 return False
+            if not old_digest and not new_digest:
+                old = json.loads(existing.get("pending_article_json") or "{}").get("raw_content", "")
+                new = json.loads(pending_article_json or "{}").get("raw_content", "")
+                if old == new:
+                    return False
+            # Keep the changed evidence locally so the common boundary can
+            # apply its append-only/quarantine revision rules.
             with self.connection:
                 self.connection.execute(
-                    "UPDATE processed_videos SET review_state = 'revision_needed', review_reason = ? WHERE video_id = ?",
-                    ("changed_body_quarantined", video_id),
+                    """UPDATE processed_videos SET channel_id=?, title=?, published_at=?,
+                       processed_at=?, has_transcript=?, pending_article_json=?, pending_metadata_json=?,
+                       persisted_at=NULL, admission_state='pending', admission_receipt_id=NULL,
+                       admission_job_id=NULL, admission_submission_id=NULL, materialization_state='unknown',
+                       review_state='revision_needed', review_reason=? WHERE video_id=?""",
+                    (channel_id, title, published_at, datetime.now(timezone.utc).isoformat(),
+                     1 if has_transcript else 0, pending_article_json, pending_metadata_json,
+                     "changed_timed_track_quarantined", video_id),
                 )
             return False
         now = datetime.now(timezone.utc).isoformat()
@@ -157,14 +184,26 @@ class CaptionsStore:
         now = persisted_at or datetime.now(timezone.utc).isoformat()
         with self.connection:
             self.connection.execute(
-                "UPDATE processed_videos SET persisted_at = ? WHERE video_id = ?",
+                "UPDATE processed_videos SET persisted_at = ?, admission_state = 'accepted' WHERE video_id = ?",
                 (now, video_id),
+            )
+
+    def record_admission(self, video_id: str, receipt: Any, *, state: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        values = [str(getattr(receipt, name)) if getattr(receipt, name, None) is not None else None
+                  for name in ("receipt_id", "job_id", "submission_id")]
+        with self.connection:
+            self.connection.execute(
+                """UPDATE processed_videos SET persisted_at=?, admission_state=?,
+                   admission_receipt_id=?, admission_job_id=?, admission_submission_id=?
+                   WHERE video_id=?""",
+                (now, state, *values, video_id),
             )
 
     def undelivered_with_transcript(self, limit: int = 25) -> List[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, review_state, review_reason
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, admission_state, admission_receipt_id, admission_job_id, admission_submission_id, materialization_state, review_state, review_reason
             FROM processed_videos
             WHERE has_transcript = 1
               AND persisted_at IS NULL
@@ -184,7 +223,7 @@ class CaptionsStore:
     def get_video(self, video_id: str) -> Optional[Dict[str, Any]]:
         cursor = self.connection.execute(
             """
-            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, review_state, review_reason
+            SELECT video_id, channel_id, title, published_at, processed_at, has_transcript, pending_article_json, pending_metadata_json, persisted_at, indexed_at, admission_state, admission_receipt_id, admission_job_id, admission_submission_id, materialization_state, review_state, review_reason
             FROM processed_videos
             WHERE video_id = ?
             """,

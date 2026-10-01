@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from .capture import canonical_timed_bytes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +41,11 @@ class MyceliumPg:
     def submit(self, envelope: Dict[str, Any], metadata: Dict[str, Any]):
         """Submit poll and backfill output through the common receipt boundary."""
         from contracts.capture import Submission  # noqa: PLC0415
+        from contracts.timed_caption import (  # noqa: PLC0415
+            TIMED_CAPTION_MEDIA_TYPE,
+            canonical_timed_caption_bytes,
+            capture_from_youtube_track,
+        )
         from persistence.ingest import admit  # noqa: PLC0415
         video_id = str(metadata["video_id"])
         track = envelope.get("raw_timed_captions") or envelope.get("caption_track")
@@ -54,7 +58,11 @@ class MyceliumPg:
         raw_track = CaptionTrack(track["video_id"], track["track_id"], track["language"],
                                   track["caption_kind"], segments,
                                   track.get("source_metadata", {}), track.get("coverage_state", "complete"))
-        raw = canonical_timed_bytes(raw_track)
+        # The typed contract is the source of truth for both bytes and media
+        # type.  Keep this conversion adjacent to admission so a future
+        # producer-shape change cannot silently turn typed evidence into prose.
+        capture = capture_from_youtube_track(raw_track.to_dict())
+        raw = canonical_timed_caption_bytes(capture)
         digest = hashlib.sha256(raw).hexdigest()
         submission = Submission(
             schema_version="capture.v1", submission_id=uuid.uuid4(), idempotency_key=f"youtube:{video_id}:{digest}",
@@ -65,8 +73,9 @@ class MyceliumPg:
                       "caption_track": envelope.get("caption_track"),
                       "cleaning": envelope.get("cleaning", {}),
                       "raw_timed_sha256": digest, "raw_timed_byte_length": len(raw),
-                      "raw_timed_encoding": "utf-8"},
-            capture={"capture_type": "supplied_capture", "content_base64": base64.b64encode(raw).decode("ascii"), "byte_length": len(raw), "sha256": digest, "media_type": "text/plain", "retrieval_metadata": {"provider": "youtube", "video_id": video_id}},
+                      "raw_timed_encoding": "utf-8", "timed_caption_schema": capture.schema_version,
+                      "timed_caption_identity": capture.identity_key},
+            capture={"capture_type": "supplied_capture", "content_base64": base64.b64encode(raw).decode("ascii"), "byte_length": len(raw), "sha256": digest, "media_type": TIMED_CAPTION_MEDIA_TYPE, "retrieval_metadata": {"provider": "youtube", "video_id": video_id}},
         )
         return admit(self._db, submission, principal_id="youtube-adapter")
 

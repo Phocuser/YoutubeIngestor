@@ -77,6 +77,7 @@ def test_happy_path(tmp_path):
     assert pg.calls[0][0]["published_at"] == "2026-09-15T00:00:00Z"
     metadata = pg.calls[0][1]
     assert metadata["video_id"] == "vid00000001" and "ads_removed_seconds" in metadata
+    assert metadata["access_scope"] == "public"
 
 
 def test_ad_text_removed(tmp_path):
