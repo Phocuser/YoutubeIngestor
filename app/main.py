@@ -61,6 +61,8 @@ def health() -> Dict[str, Any]:
         "channels_configured": info["channels_configured"],
         "last_poll_at": info["last_poll_at"],
         "last_error": info["last_error"],
+        "last_poll_status": info["last_poll_status"],
+        "paused_until": info["paused_until"],
         "total_processed_videos": info["total_processed_videos"],
     }
 

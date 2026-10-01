@@ -1,3 +1,4 @@
+import sqlite3
 import os
 import tempfile
 import pytest
@@ -91,6 +92,33 @@ def test_state_operations(temp_db):
 
     store.set_state("last_poll_status", "error: something broke")
     assert store.get_state("last_poll_status") == "error: something broke"
+
+
+def test_set_states_rolls_back_related_service_state_on_failure(temp_db):
+    store = CaptionsStore(temp_db)
+    store.connection.executescript(
+        """
+        CREATE TRIGGER reject_transcript_cooldown
+        BEFORE INSERT ON service_state
+        WHEN NEW.key = 'youtube_transcript_cooldown_until'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced cooldown write failure');
+        END;
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced cooldown write failure"):
+        store.set_states(
+            {
+                "youtube_transcript_block_streak": "1",
+                "youtube_transcript_cooldown_until": "2026-09-29T10:30:00+00:00",
+                "last_poll_status": "paused: YouTube transcript requests blocked",
+            }
+        )
+
+    assert store.get_state("youtube_transcript_block_streak") is None
+    assert store.get_state("youtube_transcript_cooldown_until") is None
+    assert store.get_state("last_poll_status") is None
 
 
 def test_mark_indexed(temp_db):
