@@ -10,6 +10,7 @@ from .service import CaptionsService
 from .store import CaptionsStore
 from .youtube_client import YouTubeClient
 from .mycelium_pg import MyceliumPg
+from .mycelium2_http import Mycelium2HTTP
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +22,10 @@ settings = Settings()
 store = CaptionsStore(settings.database_path)
 client = YouTubeClient()
 submitter = None
-if settings.mycelium_pg_url.strip():
+if settings.mycelium2_url.strip():
+    submitter = Mycelium2HTTP(settings.mycelium2_url, settings.mycelium2_api_token,
+                               settings.mycelium2_timeout_seconds)
+elif settings.mycelium_pg_url.strip():
     try:
         submitter = MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
     except (ImportError, ModuleNotFoundError) as exc:

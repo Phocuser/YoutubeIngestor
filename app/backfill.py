@@ -25,6 +25,7 @@ from .backfill_store import BackfillStore
 from .config import Settings
 from .capture import build_capture
 from .mycelium_pg import ALREADY_PRESENT, QUARANTINED, MyceliumPg
+from .mycelium2_http import Mycelium2HTTP
 from .youtube_client import TranscriptBlocked, fetch_timed_transcript
 
 LOGGER = logging.getLogger(__name__)
@@ -235,12 +236,15 @@ class Backfill:
             if hasattr(self.pg, "submit"):
                 receipt = self.pg.submit(envelope, metadata)
                 state = getattr(getattr(receipt, "state", None), "value", getattr(receipt, "state", None))
-                if state not in {"queued", "leased", "retry_wait", "succeeded"}:
+                if state not in {"queued", "leased", "retry_wait", "succeeded", "stored", "already_present"}:
                     self.store.quarantine(row["video_id"], "central receipt requires review")
                     summary.delivery_failures += 1
                     return
                 self.store.mark_persisted(row["video_id"])
-                summary.stored += 1
+                if state == ALREADY_PRESENT:
+                    summary.already_present += 1
+                else:
+                    summary.stored += 1
                 return
             raise RuntimeError("injected boundary must provide submit()")
         except Exception as exc:  # noqa: BLE001 - stays in the outbox for the next sweep
@@ -404,7 +408,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     try:
         with single_instance(settings.backfill_database_path + ".lock"):
-            pg = None if args.no_postgres else MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
+            if args.no_postgres:
+                pg = None
+            elif settings.mycelium2_url.strip():
+                pg = Mycelium2HTTP(settings.mycelium2_url, settings.mycelium2_api_token,
+                                   settings.mycelium2_timeout_seconds)
+            else:
+                pg = MyceliumPg(settings.mycelium_pg_url, settings.mycelium_dir)
             channels = [c.strip() for c in args.channels.split(",") if c.strip()] or settings.backfill_channels
             summary = Backfill(settings, store, pg, delay=(args.delay_min, args.delay_max)).run(
                 channels,
