@@ -62,7 +62,7 @@ class CaptionsService:
                 stored_metadata = json.loads(stored.get("pending_metadata_json") or "{}")
                 receipt = await asyncio.to_thread(self.submitter.submit, article, stored_metadata or {"video_id": target_id, "transcript_source": "youtube-captions"})
                 state = getattr(getattr(receipt, "state", None), "value", getattr(receipt, "state", None))
-                if state not in {"queued", "leased", "retry_wait", "succeeded", "quarantined"}:
+                if state not in {"queued", "leased", "retry_wait", "succeeded", "stored", "already_present", "quarantined"}:
                     return False
                 if target_id:
                     self.store.record_admission(target_id, receipt, state=state)

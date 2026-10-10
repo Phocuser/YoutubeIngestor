@@ -39,7 +39,7 @@ This service:
 4. If captions exist, normalizes the video into the `Article` JSON shape and stores it in the `pending_article_json` column.
 5. If captions do not exist (a common case for music, silent clips, or disabled captions), records the video with `has_transcript = 0` so it is not polled or retried forever.
 6. Genuine network or API errors record a retryable caption gap, enabling automated retry on subsequent poll cycles without claiming successful processing.
-7. Submits the canonical timed track through the shared durable capture receipt boundary. Failed delivery remains in a retryable local spool.
+7. Submits the canonical timed track as a `capture.v1` envelope to Mycelium 2 `POST /api/captures` when `MYCELIUM2_URL` is configured. Failed delivery remains in a retryable local spool.
 8. Keeps ad, self-promo, and interaction decisions as a versioned derived view. Raw timed captions are never deleted or overwritten; changed bodies are quarantined.
 
 ---
@@ -53,8 +53,11 @@ This service:
 | `DATABASE_PATH` | `string` | `data/youtube_captions.sqlite3` | SQLite database path for state and deduplication. |
 | `SERVICE_HOST` | `string` | `0.0.0.0` | Bind host for HTTP service. |
 | `SERVICE_PORT` | `int` | `8083` | Bind port for HTTP service. |
-| `MYCELIUM_PG_URL` | `string` | unset | Explicit opt-in durable Mycelium Postgres URL. When unset or blank, submission is disabled and no Mycelium database is opened. |
-| `MYCELIUM_DIR` | `string` | `../mycelium` | Filesystem path used by the Mycelium adapter if `MYCELIUM_PG_URL` is explicitly configured; this setting alone never enables database access. |
+| `MYCELIUM2_URL` | `string` | unset | Mycelium 2 base URL. When set, polling and backfill use authenticated HTTP `POST /api/captures`. |
+| `MYCELIUM2_API_TOKEN` | `string` | unset | Owner bearer token authorized to submit captures. The OSINT intake token is not sufficient. |
+| `MYCELIUM2_TIMEOUT_SECONDS` | `float` | `30` | HTTP timeout, bounded to 1–120 seconds. |
+| `MYCELIUM_PG_URL` | `string` | unset | Legacy fallback used only when `MYCELIUM2_URL` is unset. |
+| `MYCELIUM_DIR` | `string` | `../mycelium` | Filesystem path for the legacy adapter only; ignored when Mycelium 2 HTTP is configured. |
 
 ---
 
@@ -79,6 +82,8 @@ export YOUTUBE_CHANNEL_IDS="UC_x5XG1OV2P6uZZ5FSM9Ttw"
 export POLL_INTERVAL_SECONDS=900
 export DATABASE_PATH="data/youtube_captions.sqlite3"
 export SERVICE_PORT=8083
+export MYCELIUM2_URL="https://mycelium.example"
+export MYCELIUM2_API_TOKEN="<owner-token>"
 ```
 
 ### 3. Run the service

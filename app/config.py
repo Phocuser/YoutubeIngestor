@@ -23,6 +23,9 @@ class Settings:
         default_factory=lambda: os.getenv("MYCELIUM_PG_URL", "")
     )
     mycelium_dir: str = field(default_factory=lambda: os.getenv("MYCELIUM_DIR", "../mycelium"))
+    mycelium2_url: str = field(default_factory=lambda: os.getenv("MYCELIUM2_URL", ""))
+    mycelium2_api_token: str = field(default_factory=lambda: os.getenv("MYCELIUM2_API_TOKEN", ""))
+    mycelium2_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("MYCELIUM2_TIMEOUT_SECONDS", "30")))
     backfill_channels: list[str] = field(
         default_factory=lambda: _parse_channel_ids(
             os.getenv("BACKFILL_CHANNELS", "@warographics643,@HomeFronts")
