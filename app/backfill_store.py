@@ -1,16 +1,10 @@
-import logging
-import json
 import sqlite3
 import threading
-from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
-LOGGER = logging.getLogger(__name__)
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+from . import backfill_store_queries as queries
+from .backfill_store_schema import initialize_backfill_schema
 
 
 class BackfillStore:
@@ -28,54 +22,10 @@ class BackfillStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS backfill_videos (
-                        video_id TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        title TEXT NOT NULL,
-                        published_at TEXT,
-                        duration INTEGER,
-                        status TEXT NOT NULL,
-                        attempts INTEGER NOT NULL DEFAULT 0,
-                        last_error TEXT,
-                        article_uuid TEXT,
-                        pending_article_json TEXT,
-                        metadata_json TEXT,
-                        persisted_at TEXT,
-                        indexed_at TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
-                )
-                for column, definition in (
-                    ("review_state", "TEXT NOT NULL DEFAULT 'ready'"),
-                    ("review_reason", "TEXT"),
-                ):
-                    try:
-                        self.connection.execute(f"ALTER TABLE backfill_videos ADD COLUMN {column} {definition}")
-                    except sqlite3.OperationalError:
-                        pass
-                self.connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS backfill_state (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    )
-                    """
-                )
+        initialize_backfill_schema(self.connection, self._lock)
 
     def get(self, video_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            cursor = self.connection.execute(
-                "SELECT * FROM backfill_videos WHERE video_id = ?",
-                (video_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        return queries.get(self, video_id)
 
     def register(
         self,
@@ -85,61 +35,10 @@ class BackfillStore:
         duration: int | None = None,
         published_at: str | None = None,
     ) -> bool:
-        now = _now_iso()
-        with self._lock:
-            with self.connection:
-                cursor = self.connection.execute(
-                    """
-                    INSERT OR IGNORE INTO backfill_videos (
-                        video_id,
-                        channel_id,
-                        title,
-                        published_at,
-                        duration,
-                        status,
-                        attempts,
-                        created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-                    """,
-                    (video_id, channel_id, title, published_at, duration, now, now),
-                )
-                inserted = cursor.rowcount > 0
-                if published_at is not None:
-                    self.connection.execute(
-                        """
-                        UPDATE backfill_videos
-                        SET published_at = ?, updated_at = ?
-                        WHERE video_id = ?
-                        """,
-                        (published_at, now, video_id),
-                    )
-                return inserted
+        return queries.register(self, video_id, channel_id, title, duration, published_at)
 
     def todo(self, limit: int = 0, max_attempts: int = 5) -> list[dict[str, Any]]:
-        with self._lock:
-            if limit > 0:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE review_state = 'ready'
-                      AND (status = 'pending' OR (status IN ('no_transcript', 'error') AND attempts < ?))
-                    ORDER BY created_at ASC, rowid ASC
-                    LIMIT ?
-                    """,
-                    (max_attempts, limit),
-                )
-            else:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE review_state = 'ready'
-                      AND (status = 'pending' OR (status IN ('no_transcript', 'error') AND attempts < ?))
-                    ORDER BY created_at ASC, rowid ASC
-                    """,
-                    (max_attempts,),
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        return queries.todo(self, limit, max_attempts)
 
     def mark_done(
         self,
@@ -149,262 +48,56 @@ class BackfillStore:
         pending_article_json: str | None,
         metadata_json: str | None,
     ) -> None:
-        now = _now_iso()
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE backfill_videos
-                    SET status = 'done',
-                        published_at = COALESCE(?, published_at),
-                        article_uuid = ?,
-                        pending_article_json = ?,
-                        metadata_json = ?,
-                        last_error = NULL,
-                        attempts = attempts + 1,
-                        updated_at = ?
-                    WHERE video_id = ?
-                    """,
-                    (
-                        published_at,
-                        article_uuid,
-                        pending_article_json,
-                        metadata_json,
-                        now,
-                        video_id,
-                    ),
-                )
+        queries.mark_done(
+            self,
+            video_id,
+            published_at,
+            article_uuid,
+            pending_article_json,
+            metadata_json,
+        )
 
     def mark_no_transcript(
         self, video_id: str, published_at: str | None = None
     ) -> None:
-        now = _now_iso()
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE backfill_videos
-                    SET status = 'no_transcript',
-                        published_at = COALESCE(?, published_at),
-                        attempts = attempts + 1,
-                        updated_at = ?
-                    WHERE video_id = ?
-                    """,
-                    (published_at, now, video_id),
-                )
+        queries.mark_no_transcript(self, video_id, published_at)
 
     def mark_error(self, video_id: str, error: str) -> None:
-        now = _now_iso()
-        err_msg = str(error)[:500] if error is not None else None
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE backfill_videos
-                    SET status = 'error',
-                        last_error = ?,
-                        attempts = attempts + 1,
-                        updated_at = ?
-                    WHERE video_id = ?
-                    """,
-                    (err_msg, now, video_id),
-                )
+        queries.mark_error(self, video_id, error)
 
     def quarantine(self, video_id: str, reason: str) -> None:
-        now = _now_iso()
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """UPDATE backfill_videos
-                       SET review_state = 'revision_needed', review_reason = ?,
-                           status = 'quarantined', last_error = ?, updated_at = ?
-                       WHERE video_id = ?""",
-                    (reason, reason, now, video_id),
-                )
+        queries.quarantine(self, video_id, reason)
 
     def replace_pending(self, video_id: str, envelope: dict[str, Any]) -> None:
-        with self._lock, self.connection:
-            self.connection.execute(
-                "UPDATE backfill_videos SET pending_article_json = ?, updated_at = ? WHERE video_id = ? AND review_state = 'ready'",
-                (json.dumps(envelope), _now_iso(), video_id),
-            )
+        queries.replace_pending(self, video_id, envelope)
 
     def mark_persisted(
         self, video_id: str, persisted_at: str | None = None
     ) -> None:
-        now = persisted_at or _now_iso()
-        updated = _now_iso()
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE backfill_videos
-                    SET persisted_at = ?,
-                        updated_at = ?
-                    WHERE video_id = ?
-                    """,
-                    (now, updated, video_id),
-                )
+        queries.mark_persisted(self, video_id, persisted_at)
 
     def mark_indexed(
         self, video_id: str, indexed_at: str | None = None
     ) -> None:
-        now = indexed_at or _now_iso()
-        updated = _now_iso()
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE backfill_videos
-                    SET indexed_at = ?,
-                        updated_at = ?
-                    WHERE video_id = ?
-                    """,
-                    (now, updated, video_id),
-                )
+        queries.mark_indexed(self, video_id, indexed_at)
 
     def undelivered_postgres(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._lock:
-            if limit > 0:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done' AND persisted_at IS NULL AND review_state = 'ready'
-                    ORDER BY created_at ASC, rowid ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-            else:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done' AND persisted_at IS NULL AND review_state = 'ready'
-                    ORDER BY created_at ASC, rowid ASC
-                    """
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        return queries.undelivered_postgres(self, limit)
 
     def undelivered_indexer(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._lock:
-            if limit > 0:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done'
-                      AND indexed_at IS NULL
-                      AND persisted_at IS NOT NULL
-                      AND review_state = 'ready'
-                      AND pending_article_json IS NOT NULL
-                      AND pending_article_json != ''
-                    ORDER BY created_at ASC, rowid ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-            else:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done'
-                      AND indexed_at IS NULL
-                      AND persisted_at IS NOT NULL
-                      AND review_state = 'ready'
-                      AND pending_article_json IS NOT NULL
-                      AND pending_article_json != ''
-                    ORDER BY created_at ASC, rowid ASC
-                    """
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        return queries.undelivered_indexer(self, limit)
 
     def done_with_envelope(self, limit: int = 0) -> list[dict[str, Any]]:
-        with self._lock:
-            if limit > 0:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done'
-                      AND persisted_at IS NOT NULL
-                      AND review_state = 'ready'
-                      AND pending_article_json IS NOT NULL
-                      AND pending_article_json != ''
-                    ORDER BY created_at ASC, rowid ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-            else:
-                cursor = self.connection.execute(
-                    """
-                    SELECT * FROM backfill_videos
-                    WHERE status = 'done'
-                      AND persisted_at IS NOT NULL
-                      AND review_state = 'ready'
-                      AND pending_article_json IS NOT NULL
-                      AND pending_article_json != ''
-                    ORDER BY created_at ASC, rowid ASC
-                    """
-                )
-            return [dict(row) for row in cursor.fetchall()]
+        return queries.done_with_envelope(self, limit)
 
     def get_state(self, key: str, default: str | None = None) -> str | None:
-        with self._lock:
-            cursor = self.connection.execute(
-                "SELECT value FROM backfill_state WHERE key = ?",
-                (key,),
-            )
-            row = cursor.fetchone()
-            return str(row["value"]) if row is not None else default
+        return queries.get_state(self, key, default)
 
     def set_state(self, key: str, value: str) -> None:
-        with self._lock:
-            with self.connection:
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO backfill_state (key, value) VALUES (?, ?)",
-                    (key, str(value)),
-                )
+        queries.set_state(self, key, value)
 
     def stats(self) -> dict[str, int]:
-        with self._lock:
-            cursor = self.connection.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
-                    COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
-                    COUNT(CASE WHEN status = 'no_transcript' THEN 1 END) AS no_transcript,
-                    COUNT(CASE WHEN status = 'error' THEN 1 END) AS error,
-                    COUNT(CASE WHEN persisted_at IS NOT NULL THEN 1 END) AS persisted,
-                    COUNT(CASE WHEN indexed_at IS NOT NULL THEN 1 END) AS indexed,
-                    COUNT(CASE WHEN status = 'done' AND persisted_at IS NULL THEN 1 END) AS pending_postgres,
-                    COUNT(CASE WHEN status = 'done' AND indexed_at IS NULL AND pending_article_json IS NOT NULL AND pending_article_json != '' THEN 1 END) AS pending_indexer
-                FROM backfill_videos
-                """
-            )
-            row = cursor.fetchone()
-            if not row:
-                return {
-                    "total": 0,
-                    "pending": 0,
-                    "done": 0,
-                    "no_transcript": 0,
-                    "error": 0,
-                    "persisted": 0,
-                    "indexed": 0,
-                    "pending_postgres": 0,
-                    "pending_indexer": 0,
-                }
-            return {
-                "total": int(row["total"]),
-                "pending": int(row["pending"]),
-                "done": int(row["done"]),
-                "no_transcript": int(row["no_transcript"]),
-                "error": int(row["error"]),
-                "persisted": int(row["persisted"]),
-                "indexed": int(row["indexed"]),
-                "pending_postgres": int(row["pending_postgres"]),
-                "pending_indexer": int(row["pending_indexer"]),
-            }
+        return queries.stats(self)
 
     def close(self) -> None:
         with self._lock:

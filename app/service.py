@@ -191,6 +191,205 @@ class CaptionsService:
         except Exception as exc:
             LOGGER.warning("Error in retry_undelivered_articles sweep: %s", exc)
 
+    async def _fetch_feed(self, channel_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.client.fetch_channel_feed, channel_id)
+
+    async def _fetch_transcript(self, video_id: str) -> Any:
+        fetch_timed = getattr(self.client, "fetch_timed_transcript", None)
+        if not callable(fetch_timed):
+            raise RuntimeError("client lacks timed-caption boundary")
+        return await asyncio.to_thread(fetch_timed, video_id)
+
+    def _filter_video(
+        self,
+        video: dict[str, Any],
+        actual_channel_id: str,
+        channel_name: str,
+        title: str,
+        published_at: str,
+        transcript: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        video_id = video["video_id"]
+        if transcript is None:
+            LOGGER.warning("missing timed captions remain retryable for %s", video_id)
+            self.store.record_gap(video_id, actual_channel_id, title, published_at, "caption_missing")
+            return None
+        if not isinstance(transcript, (list, tuple)) or not transcript:
+            LOGGER.warning("malformed or empty captions remain retryable for %s", video_id)
+            self.store.record_gap(video_id, actual_channel_id, title, published_at, "caption_missing_or_malformed")
+            return None
+        article, metadata = build_capture(
+            video_id,
+            transcript,
+            title=title,
+            channel_id=actual_channel_id,
+            channel_name=channel_name,
+            published_at=published_at,
+            is_public_channel_feed=True,
+        )
+        if not any(segment["text"] for segment in article["caption_track"]["segments"]):
+            LOGGER.warning("empty captions remain retryable for %s", video_id)
+            self.store.record_gap(video_id, actual_channel_id, title, published_at, "caption_empty")
+            return None
+        return article, metadata
+
+    async def _record_video(
+        self,
+        video: dict[str, Any],
+        actual_channel_id: str,
+        title: str,
+        published_at: str,
+        article: dict[str, Any],
+        metadata: dict[str, Any],
+        processed_items: list[dict[str, Any]],
+    ) -> None:
+        video_id = video["video_id"]
+        recorded = self.store.record_video(
+            video_id=video_id,
+            channel_id=actual_channel_id,
+            title=title,
+            published_at=published_at,
+            has_transcript=True,
+            pending_article_json=json.dumps(article),
+            pending_metadata_json=json.dumps(metadata) if metadata else None,
+        )
+        revision_pending = self.store.get_video(video_id)
+        if recorded or (
+            revision_pending
+            and revision_pending.get("review_state") == "revision_needed"
+            and revision_pending.get("admission_state") == "pending"
+        ):
+            processed_items.append(
+                {
+                    "video_id": video_id,
+                    "channel_id": actual_channel_id,
+                    "title": title,
+                    "has_transcript": True,
+                }
+            )
+            LOGGER.info(
+                "Ingested video [%s] from %s (has_transcript=%s)",
+                video_id,
+                actual_channel_id,
+                True,
+            )
+            await self.submit_durable(article, video_id=video_id)
+
+    def _handle_blocked_transcript(
+        self,
+        feed_videos: list[dict[str, Any]],
+        video_index: int,
+        channel_id: str,
+        now: str,
+        now_dt: datetime,
+    ) -> None:
+        self._set_cooldown(now_dt)
+        for pending_video in feed_videos[video_index:]:
+            pending_id = pending_video.get("video_id")
+            if pending_id and not self.store.is_processed(pending_id):
+                self.store.record_gap(
+                    pending_id,
+                    pending_video.get("channel_id") or channel_id,
+                    pending_video.get("title", ""),
+                    pending_video.get("published_at") or now,
+                    "caption_fetch_blocked",
+                )
+        LOGGER.warning(
+            "YouTube transcript access is blocked; pausing all provider requests until %s",
+            self._cooldown_until().isoformat(),
+        )
+
+    async def _process_video(
+        self,
+        feed_videos: list[dict[str, Any]],
+        video_index: int,
+        channel_id: str,
+        now: str,
+        now_dt: datetime,
+        seen_video_ids: set[str],
+        processed_items: list[dict[str, Any]],
+    ) -> bool:
+        video = feed_videos[video_index]
+        video_id = video.get("video_id")
+        if not video_id or video_id in seen_video_ids:
+            return False
+        seen_video_ids.add(video_id)
+        title = video.get("title", "")
+        published_at = video.get("published_at") or now
+        channel_name = video.get("channel_name") or channel_id
+        actual_channel_id = video.get("channel_id") or channel_id
+        try:
+            transcript = await self._fetch_transcript(video_id)
+        except Exception as transcript_err:
+            if self._is_provider_blocked(transcript_err):
+                self._handle_blocked_transcript(
+                    feed_videos, video_index, channel_id, now, now_dt
+                )
+                return True
+            LOGGER.warning(
+                "Network/API error fetching transcript for video %s: %s",
+                video_id,
+                transcript_err,
+            )
+            self.store.record_gap(
+                video_id,
+                actual_channel_id,
+                title,
+                published_at,
+                f"caption_fetch_retryable:{type(transcript_err).__name__}",
+            )
+            return False
+
+        filtered = self._filter_video(video, actual_channel_id, channel_name, title, published_at, transcript)
+        if filtered is not None:
+            article, metadata = filtered
+            await self._record_video(
+                video,
+                actual_channel_id,
+                title,
+                published_at,
+                article,
+                metadata,
+                processed_items,
+            )
+        return False
+
+    async def _process_feed(
+        self,
+        feed_videos: list[dict[str, Any]],
+        channel_id: str,
+        now: str,
+        now_dt: datetime,
+        seen_video_ids: set[str],
+        processed_items: list[dict[str, Any]],
+    ) -> bool:
+        for video_index in range(len(feed_videos)):
+            if await self._process_video(
+                feed_videos,
+                video_index,
+                channel_id,
+                now,
+                now_dt,
+                seen_video_ids,
+                processed_items,
+            ):
+                return True
+        return False
+
+    def _finish_poll(self, blocked: bool) -> None:
+        if blocked:
+            # _set_cooldown wrote the aggregate status and avoids a per-video blocked error.
+            return
+        if self.last_error:
+            self.last_poll_status = f"error: {self.last_error}"
+            self.store.set_state("last_poll_status", self.last_poll_status)
+            return
+        if self.settings.youtube_channel_ids:
+            self.last_source_check_at = datetime.now(UTC).isoformat()
+            self.store.set_state("last_source_check_at", self.last_source_check_at)
+        self.last_poll_status = "ok"
+        self._clear_cooldown(poll_status=self.last_poll_status)
+
     async def poll_once(self) -> list[dict[str, Any]]:
         self.is_polling = True
         now_dt = self._now()
@@ -216,116 +415,10 @@ class CaptionsService:
 
             for channel_id in self.settings.youtube_channel_ids:
                 try:
-                    feed_videos = await asyncio.to_thread(
-                        self.client.fetch_channel_feed, channel_id
+                    feed_videos = await self._fetch_feed(channel_id)
+                    blocked = await self._process_feed(
+                        feed_videos, channel_id, now, now_dt, seen_video_ids, processed_items
                     )
-                    for video_index, video in enumerate(feed_videos):
-                        video_id = video.get("video_id")
-                        if not video_id:
-                            continue
-                        if video_id in seen_video_ids:
-                            continue
-                        seen_video_ids.add(video_id)
-                        title = video.get("title", "")
-                        published_at = video.get("published_at") or now
-                        channel_name = video.get("channel_name") or channel_id
-                        actual_channel_id = video.get("channel_id") or channel_id
-
-                        try:
-                            fetch_timed = getattr(self.client, "fetch_timed_transcript", None)
-                            if not callable(fetch_timed):
-                                raise RuntimeError("client lacks timed-caption boundary")
-                            transcript = await asyncio.to_thread(fetch_timed, video_id)
-                        except Exception as transcript_err:
-                            if self._is_provider_blocked(transcript_err):
-                                self._set_cooldown(now_dt)
-                                blocked = True
-                                # Preserve retryable gaps for already discovered
-                                # videos without making another provider request.
-                                for pending_video in feed_videos[video_index:]:
-                                    pending_id = pending_video.get("video_id")
-                                    if pending_id and not self.store.is_processed(pending_id):
-                                        self.store.record_gap(
-                                            pending_id,
-                                            pending_video.get("channel_id") or channel_id,
-                                            pending_video.get("title", ""),
-                                            pending_video.get("published_at") or now,
-                                            "caption_fetch_blocked",
-                                        )
-                                LOGGER.warning(
-                                    "YouTube transcript access is blocked; pausing all provider requests until %s",
-                                    self._cooldown_until().isoformat(),
-                                )
-                                break
-                            LOGGER.warning(
-                                "Network/API error fetching transcript for video %s: %s",
-                                video_id,
-                                transcript_err,
-                            )
-                            # Record a retryable gap without claiming successful processing.
-                            self.store.record_gap(video_id, actual_channel_id, title, published_at,
-                                                  f"caption_fetch_retryable:{type(transcript_err).__name__}")
-                            continue
-
-                        has_transcript = transcript is not None
-                        pending_article_json = None
-                        article = None
-                        if has_transcript:
-                            if not isinstance(transcript, (list, tuple)) or not transcript:
-                                LOGGER.warning("malformed or empty captions remain retryable for %s", video_id)
-                                self.store.record_gap(video_id, actual_channel_id, title, published_at,
-                                                      "caption_missing_or_malformed")
-                                continue
-                            article, metadata = build_capture(
-                                video_id, transcript, title=title, channel_id=actual_channel_id,
-                                channel_name=channel_name, published_at=published_at,
-                                is_public_channel_feed=True,
-                            )
-                            if not any(segment["text"] for segment in article["caption_track"]["segments"]):
-                                LOGGER.warning("empty captions remain retryable for %s", video_id)
-                                self.store.record_gap(video_id, actual_channel_id, title, published_at,
-                                                      "caption_empty")
-                                continue
-                            pending_article_json = json.dumps(article)
-                        else:
-                            LOGGER.warning("missing timed captions remain retryable for %s", video_id)
-                            self.store.record_gap(video_id, actual_channel_id, title, published_at,
-                                                  "caption_missing")
-                            continue
-
-                        recorded = self.store.record_video(
-                            video_id=video_id,
-                            channel_id=actual_channel_id,
-                            title=title,
-                            published_at=published_at,
-                            has_transcript=has_transcript,
-                            pending_article_json=pending_article_json,
-                            pending_metadata_json=json.dumps(metadata) if metadata else None,
-                        )
-                        revision_pending = self.store.get_video(video_id)
-                        if recorded or (
-                            revision_pending
-                            and revision_pending.get("review_state") == "revision_needed"
-                            and revision_pending.get("admission_state") == "pending"
-                        ):
-                            processed_items.append(
-                                {
-                                    "video_id": video_id,
-                                    "channel_id": actual_channel_id,
-                                    "title": title,
-                                    "has_transcript": has_transcript,
-                                }
-                            )
-                            LOGGER.info(
-                                "Ingested video [%s] from %s (has_transcript=%s)",
-                                video_id,
-                                actual_channel_id,
-                                has_transcript,
-                            )
-                            if has_transcript and article:
-                                await self.submit_durable(
-                                    article, video_id=video_id
-                                )
                     if blocked:
                         break
                 except Exception as channel_err:
@@ -346,19 +439,7 @@ class CaptionsService:
                 if blocked:
                     break
 
-            if blocked:
-                # _set_cooldown wrote the aggregate status and avoids a
-                # per-video blocked error.
-                pass
-            elif self.last_error:
-                self.last_poll_status = f"error: {self.last_error}"
-                self.store.set_state("last_poll_status", self.last_poll_status)
-            else:
-                if self.settings.youtube_channel_ids:
-                    self.last_source_check_at = datetime.now(UTC).isoformat()
-                    self.store.set_state("last_source_check_at", self.last_source_check_at)
-                self.last_poll_status = "ok"
-                self._clear_cooldown(poll_status=self.last_poll_status)
+            self._finish_poll(blocked)
 
         finally:
             self.is_polling = False

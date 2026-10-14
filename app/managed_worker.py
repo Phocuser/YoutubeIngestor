@@ -17,7 +17,16 @@ from .discovery_deadline import DiscoveryTimeout, MetadataTimeout, TranscriptTim
 from .managed_capture import managed_timed_capture
 from .managed_acquisition import DefaultYouTubeAcquisition
 from .managed_models import Acquisition, ItemOutcome, JobOutcome, error_code as _error_code, video_value as _video_value
-from .source_control import CONTROL_PLANE_TIMEOUT_SECONDS, ControlPlane, ControlPlaneError, LeaseLost, LeaseResponseError, SubmissionConflict, _lease_fields
+from .source_control import (
+    CONTROL_PLANE_TIMEOUT_SECONDS,
+    ControlPlane,
+    ControlPlaneError,
+    LeaseLost,
+    LeaseResponseError,
+    MyceliumSourceControlClient,  # noqa: F401 - public compatibility import
+    SubmissionConflict,
+    _lease_fields,
+)
 
 MIN_LEASE_SECONDS = 60
 DISCOVERY_TIMEOUT_CAP_SECONDS = 30.0

@@ -10,7 +10,10 @@ from youtube_transcript_api._errors import (
     TranslationLanguageNotAvailable,
 )
 
-from .transcript_http import TranscriptTimeoutSession
+from .transcript_http import (
+    TRANSCRIPT_HTTP_TIMEOUT_SECONDS,  # noqa: F401 - public compatibility import
+    TranscriptTimeoutSession,
+)
 
 LOGGER = logging.getLogger(__name__)
 
