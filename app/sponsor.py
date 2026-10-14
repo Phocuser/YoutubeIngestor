@@ -7,11 +7,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_CATEGORIES: Tuple[str, ...] = ("sponsor", "selfpromo", "interaction")
+DEFAULT_CATEGORIES: tuple[str, ...] = ("sponsor", "selfpromo", "interaction")
 
 
 @dataclass(frozen=True)
@@ -31,9 +32,9 @@ class CleanResult:
     removed_seconds: float
     removed_snippets: int
     total_snippets: int
-    sources: List[str]
-    ranges: List[Tuple[float, float]]
-    decisions: List[dict] = None
+    sources: list[str]
+    ranges: list[tuple[float, float]]
+    decisions: list[dict] = None
     policy_version: str = "ads-v1"
 
 
@@ -41,9 +42,9 @@ class SponsorBlockUnavailable(Exception):
     """Raised when the SponsorBlock API cannot be reached or returns an error."""
 
 
-def _normalize_snippets(snippets: Sequence[Any]) -> List[Snippet]:
+def _normalize_snippets(snippets: Sequence[Any]) -> list[Snippet]:
     """Convert input snippets to a list of Snippet dataclasses."""
-    result: List[Snippet] = []
+    result: list[Snippet] = []
     for s in snippets:
         if isinstance(s, Snippet):
             result.append(s)
@@ -66,7 +67,7 @@ def _normalize_snippets(snippets: Sequence[Any]) -> List[Snippet]:
     return result
 
 
-def effective_end(snippet: Snippet, next_snippet: Optional[Snippet] = None) -> float:
+def effective_end(snippet: Snippet, next_snippet: Snippet | None = None) -> float:
     """Compute effective end time of a snippet bounded by the next snippet's start."""
     declared_end = snippet.start + snippet.duration
     if next_snippet is not None and next_snippet.start > snippet.start:
@@ -74,7 +75,7 @@ def effective_end(snippet: Snippet, next_snippet: Optional[Snippet] = None) -> f
     return declared_end
 
 
-def effective_duration(snippet: Snippet, next_snippet: Optional[Snippet] = None) -> float:
+def effective_duration(snippet: Snippet, next_snippet: Snippet | None = None) -> float:
     """Compute effective duration of a snippet."""
     return max(0.0, effective_end(snippet, next_snippet) - snippet.start)
 
@@ -83,8 +84,8 @@ def fetch_sponsor_segments(
     video_id: str,
     categories: Sequence[str] = DEFAULT_CATEGORIES,
     timeout: float = 15.0,
-    opener: Optional[Callable[..., Any]] = None,
-) -> List[Tuple[float, float]]:
+    opener: Callable[..., Any] | None = None,
+) -> list[tuple[float, float]]:
     """Fetch skip/mute segments for video_id from SponsorBlock API."""
     encoded_categories = urllib.parse.quote(json.dumps(list(categories)))
     url = f"https://sponsor.ajay.app/api/skipSegments?videoID={urllib.parse.quote(video_id)}&categories={encoded_categories}"
@@ -131,7 +132,7 @@ def fetch_sponsor_segments(
     if not isinstance(data, list):
         raise SponsorBlockUnavailable("Unexpected SponsorBlock response format")
 
-    results: List[Tuple[float, float]] = []
+    results: list[tuple[float, float]] = []
     category_set = set(categories)
     for item in data:
         if not isinstance(item, dict):
@@ -161,14 +162,14 @@ def fetch_sponsor_segments(
 
 
 def merge_ranges(
-    ranges: Sequence[Tuple[float, float]], gap: float = 1.0
-) -> List[Tuple[float, float]]:
+    ranges: Sequence[tuple[float, float]], gap: float = 1.0
+) -> list[tuple[float, float]]:
     """Sort and merge overlapping ranges and ranges closer than gap seconds."""
     valid = [(float(s), float(e)) for s, e in ranges if float(e) > float(s)]
     if not valid:
         return []
     sorted_ranges = sorted(valid, key=lambda r: (r[0], r[1]))
-    merged: List[Tuple[float, float]] = []
+    merged: list[tuple[float, float]] = []
     cur_start, cur_end = sorted_ranges[0]
     for s, e in sorted_ranges[1:]:
         if s <= cur_end + gap:
@@ -223,7 +224,7 @@ AD_OUTRO_CUES = re.compile(
 )
 
 
-def _ad_start(norm: List[Snippet], first_idx: int) -> float:
+def _ad_start(norm: list[Snippet], first_idx: int) -> float:
     """Start of the ad: the nearest intro cue shortly before the first hit, else just before it."""
     first = norm[first_idx]
     for j in range(first_idx, -1, -1):
@@ -234,7 +235,7 @@ def _ad_start(norm: List[Snippet], first_idx: int) -> float:
     return max(0.0, first.start - 3.0)
 
 
-def _ad_end(norm: List[Snippet], last_idx: int) -> float:
+def _ad_end(norm: list[Snippet], last_idx: int) -> float:
     """End of the ad: the transition back to content shortly after the last hit,
     else the end of the sentence following it."""
     n = len(norm)
@@ -252,7 +253,7 @@ def _ad_end(norm: List[Snippet], last_idx: int) -> float:
     return effective_end(norm[end_idx], norm[end_idx + 1] if end_idx + 1 < n else None)
 
 
-def heuristic_ad_ranges(snippets: Sequence[Any]) -> List[Tuple[float, float]]:
+def heuristic_ad_ranges(snippets: Sequence[Any]) -> list[tuple[float, float]]:
     """Detect sponsorship / ad ranges using keyword clustering."""
     norm = _normalize_snippets(snippets)
     if not norm:
@@ -260,7 +261,7 @@ def heuristic_ad_ranges(snippets: Sequence[Any]) -> List[Tuple[float, float]]:
 
     n = len(norm)
     # Detect hits
-    hits: List[Tuple[int, Snippet, bool]] = []
+    hits: list[tuple[int, Snippet, bool]] = []
     for i, s in enumerate(norm):
         text = s.text
         prev = norm[i - 1].text if i > 0 else ""
@@ -284,7 +285,7 @@ def heuristic_ad_ranges(snippets: Sequence[Any]) -> List[Tuple[float, float]]:
         return []
 
     # Group hits into clusters (hit within 30s of previous hit joins cluster)
-    clusters: List[List[Tuple[int, Snippet, bool]]] = []
+    clusters: list[list[tuple[int, Snippet, bool]]] = []
     for item in hits:
         if not clusters:
             clusters.append([item])
@@ -296,7 +297,7 @@ def heuristic_ad_ranges(snippets: Sequence[Any]) -> List[Tuple[float, float]]:
             else:
                 clusters.append([item])
 
-    raw_ranges: List[Tuple[float, float]] = []
+    raw_ranges: list[tuple[float, float]] = []
     for cluster in clusters:
         has_strong = any(h[2] for h in cluster)
         if len(cluster) < 2 and not has_strong:
@@ -315,18 +316,18 @@ def heuristic_ad_ranges(snippets: Sequence[Any]) -> List[Tuple[float, float]]:
 
 def strip_ranges(
     snippets: Sequence[Any],
-    ranges: Sequence[Tuple[float, float]],
+    ranges: Sequence[tuple[float, float]],
     pad_before: float = 1.0,
     pad_after: float = 0.5,
     min_overlap: float = 0.35,
-) -> Tuple[List[Snippet], float, int]:
+) -> tuple[list[Snippet], float, int]:
     """Strip snippets falling inside padded ad ranges."""
     norm = _normalize_snippets(snippets)
     if not ranges or not norm:
         return norm, 0.0, 0
 
     padded_ranges = [(s - pad_before, e + pad_after) for s, e in ranges]
-    kept: List[Snippet] = []
+    kept: list[Snippet] = []
     removed_seconds = 0.0
     removed_count = 0
 
@@ -359,7 +360,7 @@ def strip_ranges(
 def join_text(snippets: Sequence[Any]) -> str:
     """Join snippet texts into a clean single string."""
     norm = _normalize_snippets(snippets)
-    cleaned: List[str] = []
+    cleaned: list[str] = []
     for s in norm:
         text = s.text
         text = re.sub(r"\[[^\]]*\]", " ", text)
@@ -375,15 +376,15 @@ def join_text(snippets: Sequence[Any]) -> str:
 def clean_transcript(
     snippets: Sequence[Any],
     video_id: str,
-    fetch: Callable[[str], List[Tuple[float, float]]] = fetch_sponsor_segments,
+    fetch: Callable[[str], list[tuple[float, float]]] = fetch_sponsor_segments,
     use_heuristic: bool = True,
 ) -> CleanResult:
     """Clean transcript snippets using SponsorBlock API with optional heuristic fallback."""
     norm = _normalize_snippets(snippets)
-    sources: List[str] = []
-    applied_ranges: List[Tuple[float, float]] = []
+    sources: list[str] = []
+    applied_ranges: list[tuple[float, float]] = []
 
-    sb_ranges: List[Tuple[float, float]] = []
+    sb_ranges: list[tuple[float, float]] = []
     fetch_failed = False
 
     try:

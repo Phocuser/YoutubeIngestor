@@ -4,7 +4,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any
+from collections.abc import Mapping
 
 
 def managed_timed_capture(envelope: Mapping[str, Any], metadata: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:

@@ -1,5 +1,4 @@
 import logging
-from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -11,7 +10,7 @@ from youtube_transcript_api._errors import (
     TranslationLanguageNotAvailable,
 )
 
-from .transcript_http import TRANSCRIPT_HTTP_TIMEOUT_SECONDS, TranscriptTimeoutSession
+from .transcript_http import TranscriptTimeoutSession
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ NO_TRANSCRIPT_EXCEPTIONS = (
 )
 
 
-def parse_feed_xml(xml_content: str, default_channel_id: str = "") -> List[Dict[str, str]]:
+def parse_feed_xml(xml_content: str, default_channel_id: str = "") -> list[dict[str, str]]:
     """Parse YouTube Atom XML feed into a list of video dictionaries."""
     root = ET.fromstring(xml_content)
 
@@ -58,7 +57,7 @@ def parse_feed_xml(xml_content: str, default_channel_id: str = "") -> List[Dict[
         else default_channel_id
     )
 
-    entries: List[Dict[str, str]] = []
+    entries: list[dict[str, str]] = []
     for entry in root.findall("atom:entry", ATOM_NAMESPACES):
         vid_el = entry.find("yt:videoId", ATOM_NAMESPACES)
         if vid_el is not None and vid_el.text:
@@ -106,7 +105,7 @@ def parse_feed_xml(xml_content: str, default_channel_id: str = "") -> List[Dict[
     return entries
 
 
-def fetch_channel_feed(channel_id: str, timeout: float = 30.0) -> List[Dict[str, str]]:
+def fetch_channel_feed(channel_id: str, timeout: float = 30.0) -> list[dict[str, str]]:
     """Fetch and parse YouTube channel Atom feed."""
     url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     with httpx.Client(timeout=timeout) as client:
@@ -115,7 +114,7 @@ def fetch_channel_feed(channel_id: str, timeout: float = 30.0) -> List[Dict[str,
         return parse_feed_xml(resp.text, default_channel_id=channel_id)
 
 
-def fetch_transcript(video_id: str) -> Optional[str]:
+def fetch_transcript(video_id: str) -> str | None:
     """Fetch transcript for a video ID using youtube-transcript-api.
 
     Returns plain text joined transcript, or None if no captions/transcript exist.
@@ -147,7 +146,7 @@ def fetch_transcript(video_id: str) -> Optional[str]:
     if not data:
         return None
 
-    snippets: List[str] = []
+    snippets: list[str] = []
     for item in data:
         if isinstance(item, dict):
             text = item.get("text", "")
@@ -169,7 +168,7 @@ class TranscriptBlocked(Exception):
 
 def fetch_timed_transcript(
     video_id: str, languages: tuple = ("en", "en-US", "en-GB")
-) -> Optional[List[tuple]]:
+) -> list[tuple] | None:
     """Return ``[(text, start, duration), ...]`` or None when no captions exist.
 
     Raises :class:`TranscriptBlocked` when YouTube throttles this IP, so callers can
@@ -203,11 +202,11 @@ class YouTubeClient:
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
 
-    def fetch_channel_feed(self, channel_id: str) -> List[Dict[str, str]]:
+    def fetch_channel_feed(self, channel_id: str) -> list[dict[str, str]]:
         return fetch_channel_feed(channel_id, timeout=self.timeout)
 
-    def fetch_transcript(self, video_id: str) -> Optional[str]:
+    def fetch_transcript(self, video_id: str) -> str | None:
         return fetch_transcript(video_id)
 
-    def fetch_timed_transcript(self, video_id: str) -> Optional[List[tuple]]:
+    def fetch_timed_transcript(self, video_id: str) -> list[tuple] | None:
         return fetch_timed_transcript(video_id)

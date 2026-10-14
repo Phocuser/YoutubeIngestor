@@ -2,15 +2,15 @@ import logging
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class BackfillStore:
@@ -68,7 +68,7 @@ class BackfillStore:
                     """
                 )
 
-    def get(self, video_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, video_id: str) -> dict[str, Any] | None:
         with self._lock:
             cursor = self.connection.execute(
                 "SELECT * FROM backfill_videos WHERE video_id = ?",
@@ -82,8 +82,8 @@ class BackfillStore:
         video_id: str,
         channel_id: str,
         title: str,
-        duration: Optional[int] = None,
-        published_at: Optional[str] = None,
+        duration: int | None = None,
+        published_at: str | None = None,
     ) -> bool:
         now = _now_iso()
         with self._lock:
@@ -116,7 +116,7 @@ class BackfillStore:
                     )
                 return inserted
 
-    def todo(self, limit: int = 0, max_attempts: int = 5) -> List[Dict[str, Any]]:
+    def todo(self, limit: int = 0, max_attempts: int = 5) -> list[dict[str, Any]]:
         with self._lock:
             if limit > 0:
                 cursor = self.connection.execute(
@@ -144,10 +144,10 @@ class BackfillStore:
     def mark_done(
         self,
         video_id: str,
-        published_at: Optional[str],
-        article_uuid: Optional[str],
-        pending_article_json: Optional[str],
-        metadata_json: Optional[str],
+        published_at: str | None,
+        article_uuid: str | None,
+        pending_article_json: str | None,
+        metadata_json: str | None,
     ) -> None:
         now = _now_iso()
         with self._lock:
@@ -176,7 +176,7 @@ class BackfillStore:
                 )
 
     def mark_no_transcript(
-        self, video_id: str, published_at: Optional[str] = None
+        self, video_id: str, published_at: str | None = None
     ) -> None:
         now = _now_iso()
         with self._lock:
@@ -222,7 +222,7 @@ class BackfillStore:
                     (reason, reason, now, video_id),
                 )
 
-    def replace_pending(self, video_id: str, envelope: Dict[str, Any]) -> None:
+    def replace_pending(self, video_id: str, envelope: dict[str, Any]) -> None:
         with self._lock, self.connection:
             self.connection.execute(
                 "UPDATE backfill_videos SET pending_article_json = ?, updated_at = ? WHERE video_id = ? AND review_state = 'ready'",
@@ -230,7 +230,7 @@ class BackfillStore:
             )
 
     def mark_persisted(
-        self, video_id: str, persisted_at: Optional[str] = None
+        self, video_id: str, persisted_at: str | None = None
     ) -> None:
         now = persisted_at or _now_iso()
         updated = _now_iso()
@@ -247,7 +247,7 @@ class BackfillStore:
                 )
 
     def mark_indexed(
-        self, video_id: str, indexed_at: Optional[str] = None
+        self, video_id: str, indexed_at: str | None = None
     ) -> None:
         now = indexed_at or _now_iso()
         updated = _now_iso()
@@ -263,7 +263,7 @@ class BackfillStore:
                     (now, updated, video_id),
                 )
 
-    def undelivered_postgres(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def undelivered_postgres(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             if limit > 0:
                 cursor = self.connection.execute(
@@ -285,7 +285,7 @@ class BackfillStore:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
-    def undelivered_indexer(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def undelivered_indexer(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             if limit > 0:
                 cursor = self.connection.execute(
@@ -317,7 +317,7 @@ class BackfillStore:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
-    def done_with_envelope(self, limit: int = 0) -> List[Dict[str, Any]]:
+    def done_with_envelope(self, limit: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             if limit > 0:
                 cursor = self.connection.execute(
@@ -347,7 +347,7 @@ class BackfillStore:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    def get_state(self, key: str, default: str | None = None) -> str | None:
         with self._lock:
             cursor = self.connection.execute(
                 "SELECT value FROM backfill_state WHERE key = ?",
@@ -364,7 +364,7 @@ class BackfillStore:
                     (key, str(value)),
                 )
 
-    def stats(self) -> Dict[str, int]:
+    def stats(self) -> dict[str, int]:
         with self._lock:
             cursor = self.connection.execute(
                 """

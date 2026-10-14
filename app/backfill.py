@@ -16,15 +16,16 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
-from . import channel_videos, sponsor
+from . import channel_videos
 from .backfill_store import BackfillStore
 from .config import Settings
 from .capture import build_capture
-from .mycelium_pg import ALREADY_PRESENT, QUARANTINED, MyceliumPg
+from .mycelium_pg import ALREADY_PRESENT, MyceliumPg
 from .mycelium2_http import Mycelium2HTTP
 from .youtube_client import TranscriptBlocked, fetch_timed_transcript
 
@@ -82,7 +83,7 @@ class Backfill:
         self,
         settings: Settings,
         store: BackfillStore,
-        pg: Optional[MyceliumPg],
+        pg: MyceliumPg | None,
         *,
         list_videos: Callable = channel_videos.list_channel_videos,
         fetch_meta: Callable = channel_videos.fetch_video_meta,
@@ -112,7 +113,7 @@ class Backfill:
     # -- discovery ----------------------------------------------------------
 
     @staticmethod
-    def _validate_discovery_bounds(limit: int, backfill_days: Optional[int]) -> None:
+    def _validate_discovery_bounds(limit: int, backfill_days: int | None) -> None:
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("limit must be an integer")
         if limit != 0 and not (MIN_DISCOVERY_LIMIT <= limit <= MAX_DISCOVERY_LIMIT):
@@ -126,7 +127,7 @@ class Backfill:
         if limit == 0:
             raise ValueError("backfill_days requires a limit from 1 through 1000")
 
-    def _list_channel_videos(self, handle: str, limit: Optional[int]):
+    def _list_channel_videos(self, handle: str, limit: int | None):
         """Call injected enumerators with a bound while keeping old adapters usable."""
         if limit is None:
             return self._list_videos(handle)
@@ -144,7 +145,7 @@ class Backfill:
             return self._list_videos(handle, limit=limit)
         return self._list_videos(handle)
 
-    def _publication_date(self, value: Any) -> Optional[datetime]:
+    def _publication_date(self, value: Any) -> datetime | None:
         if not isinstance(value, str) or not value.strip():
             return None
         try:
@@ -152,19 +153,19 @@ class Backfill:
         except ValueError:
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     def _mark_incomplete(self, summary: Summary) -> None:
         summary.incomplete = True
 
-    def _window_bounds(self, backfill_days: Optional[int]):
+    def _window_bounds(self, backfill_days: int | None):
         if backfill_days is None:
             return None
-        now = datetime.fromtimestamp(self._wall(), timezone.utc)
+        now = datetime.fromtimestamp(self._wall(), UTC)
         return now - timedelta(days=backfill_days), now
 
-    def _row_in_window(self, row: Dict[str, Any], summary: Summary, window) -> bool:
+    def _row_in_window(self, row: dict[str, Any], summary: Summary, window) -> bool:
         if window is None:
             return True
         cutoff, now = window
@@ -180,11 +181,11 @@ class Backfill:
 
     def discover(
         self,
-        channels: List[str],
+        channels: list[str],
         summary: Summary,
         *,
         limit: int = 0,
-        backfill_days: Optional[int] = None,
+        backfill_days: int | None = None,
         window=None,
     ) -> None:
         self._validate_discovery_bounds(limit, backfill_days)
@@ -225,7 +226,7 @@ class Backfill:
 
     # -- delivery -----------------------------------------------------------
 
-    def _deliver_pg(self, row: Dict[str, Any], summary: Summary) -> None:
+    def _deliver_pg(self, row: dict[str, Any], summary: Summary) -> None:
         if self.pg is None:
             summary.delivery_failures += 1
             LOGGER.warning("no explicit Mycelium capture boundary configured for %s", row["video_id"])
@@ -305,7 +306,7 @@ class Backfill:
                 self._sleep(wait)
         return None, False
 
-    def process_video(self, row: Dict[str, Any], summary: Summary) -> bool:
+    def process_video(self, row: dict[str, Any], summary: Summary) -> bool:
         """Returns False when the run should stop (persistent throttling)."""
         video_id = row["video_id"]
         try:
@@ -351,12 +352,12 @@ class Backfill:
 
     def run(
         self,
-        channels: List[str],
+        channels: list[str],
         *,
         limit: int = 0,
         max_hours: float = 0.0,
         discover: bool = True,
-        backfill_days: Optional[int] = None,
+        backfill_days: int | None = None,
     ) -> Summary:
         self._validate_discovery_bounds(limit, backfill_days)
 
@@ -387,7 +388,7 @@ class Backfill:
         return summary
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="app.backfill", description=__doc__.splitlines()[0])
     parser.add_argument("--limit", type=int, default=0, help="process at most N videos")
     parser.add_argument("--backfill-days", type=int, default=None, help="only discover videos published in the last N days")

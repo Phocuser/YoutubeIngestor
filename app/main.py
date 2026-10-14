@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -57,7 +57,7 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health() -> dict[str, Any]:
     info = service.check_health()
     return {
         "ok": info["status"] == "healthy",
@@ -75,7 +75,7 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/poll-now")
-async def poll_now() -> Dict[str, Any]:
+async def poll_now() -> dict[str, Any]:
     if service.is_polling:
         return {"status": "busy", "message": "Poll already in progress"}
     processed = await service.poll_once()

@@ -1,8 +1,9 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 from .config import Settings
 from .capture import build_capture
@@ -22,26 +23,26 @@ class CaptionsService:
         self,
         settings: Settings,
         store: CaptionsStore,
-        client: Optional[YouTubeClient] = None,
+        client: YouTubeClient | None = None,
         submitter=None,
-        clock: Optional[Callable[[], datetime]] = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.settings = settings
         self.store = store
         self.client = client or YouTubeClient()
         self.submitter = submitter
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self.last_poll_at: Optional[str] = self.store.get_state("last_poll_at")
-        self.last_source_check_at: Optional[str] = self.store.get_state("last_source_check_at")
-        self.last_error: Optional[str] = None
-        self.last_poll_status: Optional[str] = self.store.get_state("last_poll_status")
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self.last_poll_at: str | None = self.store.get_state("last_poll_at")
+        self.last_source_check_at: str | None = self.store.get_state("last_source_check_at")
+        self.last_error: str | None = None
+        self.last_poll_status: str | None = self.store.get_state("last_poll_status")
         self.is_polling: bool = False
 
     def _now(self) -> datetime:
         now = self._clock()
-        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
 
-    def _cooldown_until(self) -> Optional[datetime]:
+    def _cooldown_until(self) -> datetime | None:
         value = self.store.get_state(TRANSCRIPT_COOLDOWN_UNTIL)
         if not value:
             return None
@@ -50,7 +51,7 @@ class CaptionsService:
         except ValueError:
             LOGGER.warning("Ignoring malformed transcript cooldown state")
             return None
-        return until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+        return until if until.tzinfo is not None else until.replace(tzinfo=UTC)
 
     @staticmethod
     def _paused_status(until: datetime) -> str:
@@ -86,8 +87,8 @@ class CaptionsService:
         self.last_poll_status = status
         return until
 
-    def _clear_cooldown(self, poll_status: Optional[str] = None) -> None:
-        updates: Dict[str, str] = {}
+    def _clear_cooldown(self, poll_status: str | None = None) -> None:
+        updates: dict[str, str] = {}
         if self.store.get_state(TRANSCRIPT_BLOCK_STREAK) is not None:
             updates[TRANSCRIPT_BLOCK_STREAK] = "0"
         if self.store.get_state(TRANSCRIPT_COOLDOWN_UNTIL) is not None:
@@ -96,7 +97,7 @@ class CaptionsService:
             updates["last_poll_status"] = poll_status
         self.store.set_states(updates)
 
-    def check_health(self) -> Dict[str, Any]:
+    def check_health(self) -> dict[str, Any]:
         cooldown_until = self._cooldown_until()
         now = self._now()
         paused = cooldown_until is not None and cooldown_until > now
@@ -119,7 +120,7 @@ class CaptionsService:
         }
 
     async def submit_durable(
-        self, article: dict, video_id: Optional[str] = None
+        self, article: dict, video_id: str | None = None
     ) -> bool:
         target_id = video_id
         if target_id is None:
@@ -190,14 +191,14 @@ class CaptionsService:
         except Exception as exc:
             LOGGER.warning("Error in retry_undelivered_articles sweep: %s", exc)
 
-    async def poll_once(self) -> List[Dict[str, Any]]:
+    async def poll_once(self) -> list[dict[str, Any]]:
         self.is_polling = True
         now_dt = self._now()
         now = now_dt.isoformat()
         self.last_poll_at = now
         self.store.set_state("last_poll_at", now)
         self.last_error = None
-        processed_items: List[Dict[str, Any]] = []
+        processed_items: list[dict[str, Any]] = []
         seen_video_ids: set[str] = set()
         blocked = False
 
@@ -354,7 +355,7 @@ class CaptionsService:
                 self.store.set_state("last_poll_status", self.last_poll_status)
             else:
                 if self.settings.youtube_channel_ids:
-                    self.last_source_check_at = datetime.now(timezone.utc).isoformat()
+                    self.last_source_check_at = datetime.now(UTC).isoformat()
                     self.store.set_state("last_source_check_at", self.last_source_check_at)
                 self.last_poll_status = "ok"
                 self._clear_cooldown(poll_status=self.last_poll_status)

@@ -4,9 +4,8 @@ import sys
 import uuid
 import base64
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 
 LOGGER = logging.getLogger(__name__)
@@ -38,7 +37,7 @@ class MyceliumPg:
         self._redis = (host, int(port or 6379))
         self.last_stored = None
 
-    def submit(self, envelope: Dict[str, Any], metadata: Dict[str, Any]):
+    def submit(self, envelope: dict[str, Any], metadata: dict[str, Any]):
         """Submit poll and backfill output through the common receipt boundary."""
         from contracts.capture import Submission  # noqa: PLC0415
         from contracts.timed_caption import (  # noqa: PLC0415
@@ -85,5 +84,5 @@ class MyceliumPg:
         LOGGER.warning("legacy importer worker drain disabled; use the central Mycelium worker")
         return 0
 
-    def insert(self, envelope: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    def insert(self, envelope: dict[str, Any], metadata: dict[str, Any]) -> str:
         raise RuntimeError("LEGACY_PATH_DISABLED: use submit()")

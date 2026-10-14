@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Callable, Mapping
+from typing import Any
+from collections.abc import Callable
 
 from . import sponsor
 from .models import CaptionTrack, timed_track

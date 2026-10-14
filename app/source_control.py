@@ -1,7 +1,8 @@
 """HTTP control client for Mycelium managed source jobs."""
 from __future__ import annotations
 
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 import httpx

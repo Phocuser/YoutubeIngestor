@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 try:  # Keep entrypoint imports clean when the optional provider tool is absent.
     import yt_dlp
@@ -18,8 +19,8 @@ YTDLP_SOCKET_TIMEOUT_SECONDS = 15
 class VideoRef:
     video_id: str
     title: str
-    duration: Optional[int]
-    published_at: Optional[str] = None
+    duration: int | None
+    published_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,7 @@ class VideoMeta:
     video_id: str
     title: str
     published_at: str
-    duration: Optional[int]
+    duration: int | None
     channel_id: str
     channel_name: str
     description: str
@@ -70,9 +71,9 @@ def _parse_upload_date(raw_date: Any) -> str:
 def list_channel_videos(
     handle_or_url: str,
     min_duration: int = 120,
-    ydl_factory: Optional[Callable[..., Any]] = None,
-    limit: Optional[int] = None,
-) -> List[VideoRef]:
+    ydl_factory: Callable[..., Any] | None = None,
+    limit: int | None = None,
+) -> list[VideoRef]:
     """Extract flat video references from a YouTube channel."""
     if limit is not None and (
         isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
@@ -113,7 +114,7 @@ def list_channel_videos(
                 yield entry
 
     seen_ids = set()
-    results: List[VideoRef] = []
+    results: list[VideoRef] = []
     raw_candidates = 0
     raw_bound_reached = False
     for entry in iter_flat_entries():
@@ -129,7 +130,7 @@ def list_channel_videos(
             continue
 
         raw_duration = entry.get("duration")
-        dur_int: Optional[int] = None
+        dur_int: int | None = None
         if raw_duration is not None:
             try:
                 dur_int = int(raw_duration)
@@ -164,7 +165,7 @@ def list_channel_videos(
 
 def fetch_video_meta(
     video_id: str,
-    ydl_factory: Optional[Callable[..., Any]] = None,
+    ydl_factory: Callable[..., Any] | None = None,
 ) -> VideoMeta:
     """Fetch metadata for a single YouTube video."""
     opts = {
@@ -181,7 +182,7 @@ def fetch_video_meta(
         info = ydl.extract_info(url, download=False) or {}
 
     raw_duration = info.get("duration")
-    dur_int: Optional[int] = None
+    dur_int: int | None = None
     if raw_duration is not None:
         try:
             dur_int = int(raw_duration)

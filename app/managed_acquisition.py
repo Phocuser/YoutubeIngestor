@@ -1,7 +1,8 @@
 """Production YouTube acquisition boundary for managed source jobs."""
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from .channel_videos import VideoMeta, VideoRef, fetch_video_meta, list_channel_videos
 
