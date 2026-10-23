@@ -2,9 +2,9 @@ name: YouTube Ingestor release
 
 on:
   push:
-    branches: [release]
+    branches: [staging]
   pull_request:
-    branches: [release]
+    branches: [staging]
 
 permissions:
   contents: read
